@@ -1,0 +1,21 @@
+{
+  "name": "星莓伴学",
+  "short_name": "星莓伴学",
+  "start_url": "/",
+  "display": "fullscreen",
+  "background_color": "#FAF4EC",
+  "theme_color": "#EC5F9B",
+  "orientation": "landscape",
+  "icons": [
+    {
+      "src": "/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png"
+    },
+    {
+      "src": "/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png"
+    }
+  ]
+}

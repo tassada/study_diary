@@ -1,0 +1,566 @@
+import asyncio
+import json
+import time
+import uuid
+from sqlalchemy import select
+from ..database import AsyncSessionLocal
+from ..models import (
+    AsyncJobModel,
+    ChildModel,
+    DailyEvalModel,
+    MistakeModel,
+    TaskImageModel,
+    TaskModel,
+    utc_now_iso,
+)
+from ..providers.deepseek_tools import recognize_image_via_deepseek_ocr
+from ..providers.minio_store import minio_gateway
+from .audit_logger import log_error, log_event
+from .dsh_supervisor import job_supervisor, run_supervised_dsh_task
+from .image_pipeline import (
+    crop_mistake_region_jpeg,
+    is_likely_sideways_ocr,
+    render_mistake_explanation_svg,
+    rotate_jpeg_clockwise,
+    score_ocr_uprightness,
+)
+
+
+async def update_job_progress(job_id: str, status: str, progress_text: str) -> None:
+    job_supervisor.heartbeat(job_id)
+    async with AsyncSessionLocal() as db:
+        job = await db.get(AsyncJobModel, job_id)
+        if job:
+            job.status = status
+            job.progress_text = progress_text
+            await db.commit()
+
+
+async def parse_voice_tasks_with_dsh(
+    child: ChildModel,
+    transcript: str,
+    target_date: str,
+    existing_drafts: list[dict] | None = None,
+    is_refinement: bool = False,
+) -> dict:
+    mode_desc = (
+        f"当前已有草稿列表：{json.dumps(existing_drafts or [], ensure_ascii=False)}。请根据孩子的修改语音对草稿进行调整或追加。"
+        if is_refinement and existing_drafts
+        else "请将孩子的语音说明拆解为 1 到多项独立学习任务卡片。"
+    )
+
+    prompt = (
+        f"任务类型：语音建立/修改学习任务（目标日期：{target_date}）。\n"
+        f"学生：{child.display_name}（{child.age}岁，{child.grade_label}）。\n"
+        f"孩子刚才说的语音转写内容：「{transcript}」\n"
+        f"{mode_desc}\n"
+        "请严格返回纯 JSON 对象（不要用 Markdown 代码块以外的解释；不要生成排期或开始时间，开始时间以学生自己点击开始计时为准），格式如下：\n"
+        "{\n"
+        '  "spokenReply": "用海星老师温暖简短的口吻向孩子确认安排好的任务",\n'
+        '  "drafts": [\n'
+        "    {\n"
+        '      "draftId": "draft-1",\n'
+        '      "title": "规范清晰的四年级学习任务名称(4-16字)",\n'
+        '      "timerMode": "countdown 或 stopwatch (有明确作业时限选countdown，自由阅读/拓展选stopwatch)",\n'
+        '      "plannedDurationMinutes": 25,\n'
+        '      "subject": "chinese | math | english | reading | science | art 之一",\n'
+        '      "categoryTags": ["如 口算练习 / 生字默写 / 课文背诵 / 错题订正 / 自主阅读"],\n'
+        '      "difficulty": 2,\n'
+        '      "rewardStars": 30,\n'
+        '      "scoringRubric": {"focus": 30, "completeness": 30, "accuracy": 40},\n'
+        '      "scoreHint": "本任务独立100分制评分说明（如：专注按时30分+书写完整30分+准确自查40分，通关奖30星莓币）"\n'
+        "    }\n"
+        "  ]\n"
+        "}"
+    )
+
+    result_json, new_session_id = await run_supervised_dsh_task(
+        child,
+        task_kind="voice_parse",
+        task_prompt=prompt,
+    )
+
+    spoken = str(result_json.get("spokenReply") or "海星老师帮你把学习卡片整理好啦！")
+
+    return {
+        "spokenReply": spoken,
+        "ttsMinioKey": None,
+        "drafts": result_json.get("drafts") or [],
+        "newSessionId": new_session_id,
+    }
+
+
+async def execute_homework_review_job(job_id: str, task_id: str, upload_kind: str) -> None:
+    started = time.perf_counter()
+    job_supervisor.mark_started(job_id)
+    try:
+        async with AsyncSessionLocal() as db:
+            task = await db.get(TaskModel, task_id)
+            if not task:
+                raise RuntimeError("未找到对应的学习任务")
+            child = await db.get(ChildModel, task.child_id)
+            if not child:
+                raise RuntimeError("未找到对应的学生档案")
+
+            img_res = await db.execute(
+                select(TaskImageModel)
+                .where(TaskImageModel.task_id == task_id)
+                .order_by(TaskImageModel.created_at.asc())
+            )
+            all_images = list(img_res.scalars().all())
+
+            pending_images = [img for img in all_images if img.ocr_status != "done"]
+            total_pending = len(pending_images)
+
+            for idx, img_row in enumerate(pending_images):
+                await update_job_progress(
+                    job_id,
+                    "ocr_running",
+                    f"正在用 DeepSeek OCR 识别新上传作业图片 ({idx + 1}/{total_pending})...",
+                )
+                img_bytes, _ = await minio_gateway.get_object_bytes(img_row.minio_key)
+                ocr_out = await recognize_image_via_deepseek_ocr(img_bytes, img_row.file_name)
+                if is_likely_sideways_ocr(ocr_out["boxes"]):
+                    cw_bytes, cw_w, cw_h = rotate_jpeg_clockwise(img_bytes, 90)
+                    ccw_bytes, ccw_w, ccw_h = rotate_jpeg_clockwise(img_bytes, 270)
+                    cw_ocr, ccw_ocr = await asyncio.gather(
+                        recognize_image_via_deepseek_ocr(cw_bytes, img_row.file_name),
+                        recognize_image_via_deepseek_ocr(ccw_bytes, img_row.file_name),
+                    )
+                    base_score = score_ocr_uprightness(ocr_out["boxes"], ocr_out["plain_text"])
+                    cw_score = score_ocr_uprightness(cw_ocr["boxes"], cw_ocr["plain_text"])
+                    ccw_score = score_ocr_uprightness(ccw_ocr["boxes"], ccw_ocr["plain_text"])
+                    if cw_score > base_score + 25.0 and cw_score >= ccw_score:
+                        await minio_gateway.put_bytes(img_row.minio_key, cw_bytes, "image/jpeg")
+                        img_row.width = cw_w
+                        img_row.height = cw_h
+                        img_row.file_size = len(cw_bytes)
+                        ocr_out = cw_ocr
+                        log_event(
+                            "homework.image_auto_uprighted",
+                            f"自动顺时针旋转90°放正横拍作业图: {img_row.id}",
+                            taskId=task.id,
+                            imageId=img_row.id,
+                            degreesCw=90,
+                        )
+                    elif ccw_score > base_score + 25.0:
+                        await minio_gateway.put_bytes(img_row.minio_key, ccw_bytes, "image/jpeg")
+                        img_row.width = ccw_w
+                        img_row.height = ccw_h
+                        img_row.file_size = len(ccw_bytes)
+                        ocr_out = ccw_ocr
+                        log_event(
+                            "homework.image_auto_uprighted",
+                            f"自动逆时针旋转90°放正横拍作业图: {img_row.id}",
+                            taskId=task.id,
+                            imageId=img_row.id,
+                            degreesCw=270,
+                        )
+                img_row.ocr_status = "done"
+                img_row.ocr_raw_text = ocr_out["raw_text"]
+                img_row.ocr_plain_text = ocr_out["plain_text"]
+                img_row.ocr_boxes_json = json.dumps(ocr_out["boxes"], ensure_ascii=False)
+                img_row.ocr_processed_at = utc_now_iso()
+                await db.commit()
+
+            await update_job_progress(
+                job_id,
+                "dsh_running",
+                f"正在唤起 {child.display_name} 专属 DSH 智能体批阅作业、核对记忆并生成错题精讲...",
+            )
+
+            mistake_res = await db.execute(
+                select(MistakeModel).where(MistakeModel.task_id == task_id)
+            )
+            existing_mistakes = list(mistake_res.scalars().all())
+
+            ocr_pages_payload = []
+            for p_idx, img_row in enumerate(all_images):
+                ocr_pages_payload.append(
+                    {
+                        "pageNo": p_idx + 1,
+                        "imageId": img_row.id,
+                        "uploadKind": img_row.upload_kind,
+                        "ocrRawWithBoxes": img_row.ocr_raw_text[:4000],
+                        "ocrPlainText": img_row.ocr_plain_text[:2500],
+                    }
+                )
+
+            open_mistakes_payload = [
+                {
+                    "mistakeId": m.id,
+                    "questionTitle": m.question_title,
+                    "wrongSnippet": m.wrong_snippet,
+                    "masteryStatus": m.mastery_status,
+                }
+                for m in existing_mistakes
+                if m.mastery_status == "open"
+            ]
+
+            dsh_prompt = (
+                f"任务类型：作业批阅、单任务100分制打分与错题精讲（上传模式：{upload_kind}）。\n"
+                f"学生：{child.display_name}（{child.age}岁，{child.grade_label}）。\n"
+                f"作业标题：{task.title}（学科：{task.subject}，难度：{task.difficulty}星）。\n"
+                f"计时表现：计划 {round(task.planned_duration_sec / 60, 1)} 分钟，实际专注 {round(task.actual_duration_sec / 60, 1)} 分钟，暂停 {task.pause_count} 次。\n"
+                f"孩子语音自述：「{task.summary_voice_text or '已认真完成作业'}」\n"
+                f"历史首次得分：{task.initial_score}，当前得分：{task.earned_score}。\n"
+                f"全部作业页 DeepSeek OCR 结果（含 0-1000 归一化 <｜box｜> 坐标）：\n{json.dumps(ocr_pages_payload, ensure_ascii=False)}\n"
+                f"本任务待订正旧错题：{json.dumps(open_mistakes_payload, ensure_ascii=False)}\n\n"
+                "请先结合当前目录下的 `MEMORY.md` 和 `mistakes.jsonl` 检查孩子的薄弱点，把本次新发现的知识薄弱点或已订正攻克情况更新写入 `MEMORY.md` 和 `mistakes.jsonl`。\n"
+                "注意评分与错题规则：\n"
+                "1. 本任务采用独立 100 分制（专注30 + 完整度30 + 准确率40）。若 uploadKind 为 correction（错题订正重传）且新图片证实改对了旧错题，允许在原分基础上追回最高 80% 的扣分（不超过98分），并把对应 mistakeId 列入 masteredMistakeIds。\n"
+                "2. 请仔细检查 OCR 识别出的算式、生字、单词或句子是否有错题、涂改易错点或步骤缺失；若有错题（或值得重点点拨的薄弱题），请在 newMistakes 中给出详细分步讲解、原图对应的 imageId 与 [x1,y1,x2,y2] (0-1000坐标)，并出一道同类型四年级巩固练习题。\n"
+                "3. quickPraise 必须是首尾完整、独立可读的总结评语（先肯定做对亮点，再点明核心改进结论与鼓励收尾），严禁写成“我们一道一道来！”“下面一起来看看”等未说完的悬空引子。\n"
+                "最后请严格只输出一个纯 JSON 对象，格式如下：\n"
+                "{\n"
+                '  "score": 92,\n'
+                '  "quickPraise": "海星老师首尾完整、独立自洽的总结夸奖与改进点拨（70-130字，句意闭合完整）",\n'
+                '  "masteredMistakeIds": [],\n'
+                '  "newMistakes": [\n'
+                "    {\n"
+                '      "imageId": "对应图片imageId",\n'
+                '      "box": [60, 350, 920, 560],\n'
+                '      "questionTitle": "错题/易错题简短标题",\n'
+                '      "wrongSnippet": "孩子原卷上的错误写法或卡壳点",\n'
+                '      "errorCause": "温柔清晰的错因分析",\n'
+                '      "correctSteps": ["第一步：...", "第二步：...", "第三步：得出正确答案..."],\n'
+                '      "practiceQuestion": "一道同知识点举一反三小练习题",\n'
+                '      "practiceAnswer": "练习题答案与简析",\n'
+                '      "spokenExplanation": "海星老师给孩子语音讲这道错题的口语讲稿（80-150字）"\n'
+                "    }\n"
+                "  ]\n"
+                "}"
+            )
+
+            eval_data, new_session_id = await run_supervised_dsh_task(
+                child,
+                task_kind="homework_review",
+                task_prompt=dsh_prompt,
+                context={"uploadKind": upload_kind},
+            )
+            if new_session_id:
+                child.dsh_tutor_session_id = new_session_id
+
+            await update_job_progress(
+                job_id,
+                "tts_running",
+                "正在裁切原卷错题框并渲染图文精讲卡片...",
+            )
+
+            new_score = max(0, min(100, int(eval_data.get("score", 90))))
+            prev_score = task.earned_score
+            if task.initial_score is None:
+                task.initial_score = new_score
+            if upload_kind == "correction" and prev_score is not None:
+                task.revision_count += 1
+                task.earned_score = max(prev_score, new_score)
+            else:
+                task.earned_score = new_score
+
+            praise_text = str(eval_data.get("quickPraise") or f"太棒啦！本关拿到了 {task.earned_score} 分！")
+            task.ai_quick_praise = praise_text
+            task.praise_tts_key = None
+            task.status = "completed"
+            task.completed_at = None
+            task.updated_at = utc_now_iso()
+
+            if prev_score is None:
+                child.star_coins += task.reward_stars
+            elif task.earned_score > prev_score:
+                child.star_coins += max(5, (task.earned_score - prev_score))
+
+            mastered_ids = set(eval_data.get("masteredMistakeIds") or [])
+            if mastered_ids:
+                for m in existing_mistakes:
+                    if m.id in mastered_ids and m.mastery_status != "mastered":
+                        m.mastery_status = "mastered"
+                        m.mastered_at = utc_now_iso()
+
+            image_bytes_cache: dict[str, bytes] = {}
+            img_map = {im.id: im for im in all_images}
+
+            for m_item in eval_data.get("newMistakes") or []:
+                m_id = f"mstk-{uuid.uuid4().hex[:12]}"
+                src_img_id = m_item.get("imageId")
+                box_coords = m_item.get("box") or []
+                crop_key: str | None = None
+
+                if src_img_id and src_img_id in img_map and isinstance(box_coords, list) and len(box_coords) == 4:
+                    if src_img_id not in image_bytes_cache:
+                        raw_b, _ = await minio_gateway.get_object_bytes(img_map[src_img_id].minio_key)
+                        image_bytes_cache[src_img_id] = raw_b
+                    cropped_jpeg = crop_mistake_region_jpeg(
+                        image_bytes_cache[src_img_id],
+                        [int(v) for v in box_coords],
+                    )
+                    if cropped_jpeg:
+                        crop_key = f"ocr-crops/{task.child_id}/{m_id}.jpg"
+                        await minio_gateway.put_bytes(crop_key, cropped_jpeg, "image/jpeg")
+
+                q_title = str(m_item.get("questionTitle") or "重点错题精讲")
+                w_snip = str(m_item.get("wrongSnippet") or "见原卷标注区域")
+                e_cause = str(m_item.get("errorCause") or "审题或计算细节需留意")
+                c_steps = [str(s) for s in (m_item.get("correctSteps") or ["对照题目条件逐步演算核对"])]
+                p_ques = str(m_item.get("practiceQuestion") or "")
+                p_ans = str(m_item.get("practiceAnswer") or "")
+
+                svg_bytes = render_mistake_explanation_svg(
+                    q_title,
+                    w_snip,
+                    e_cause,
+                    c_steps,
+                    p_ques,
+                )
+                diagram_key = f"dsh-diagrams/{task.child_id}/{m_id}.svg"
+                await minio_gateway.put_bytes(diagram_key, svg_bytes, "image/svg+xml")
+
+                db.add(
+                    MistakeModel(
+                        id=m_id,
+                        child_id=child.id,
+                        task_id=task.id,
+                        image_id=src_img_id if src_img_id in img_map else None,
+                        question_title=q_title,
+                        wrong_snippet=w_snip,
+                        error_cause=e_cause,
+                        correct_steps_json=json.dumps(c_steps, ensure_ascii=False),
+                        practice_question=p_ques,
+                        practice_answer=p_ans,
+                        crop_minio_key=crop_key,
+                        diagram_minio_key=diagram_key,
+                        tts_minio_key=None,
+                        mastery_status="open",
+                    )
+                )
+
+            final_iso = utc_now_iso()
+            task.updated_at = final_iso
+            job = await db.get(AsyncJobModel, job_id)
+            if job:
+                job.status = "succeeded"
+                job.progress_text = "批阅与图文错题讲解已生成完毕！"
+                job.result_json = json.dumps({"earnedScore": task.earned_score}, ensure_ascii=False)
+                job.finished_at = final_iso
+
+            await db.commit()
+            log_event(
+                "homework.review_succeeded",
+                f"作业异步批阅完成: {task.title}",
+                jobId=job_id,
+                childId=child.id,
+                taskId=task.id,
+                uploadKind=upload_kind,
+                ocrNewImages=total_pending,
+                earnedScore=task.earned_score,
+                newMistakes=len(eval_data.get("newMistakes") or []),
+                elapsedMs=round((time.perf_counter() - started) * 1000, 1),
+            )
+    except Exception as exc:
+        log_error(
+            "homework.review_failed",
+            f"作业异步批阅失败 (task={task_id}, job={job_id})",
+            exc=exc,
+            jobId=job_id,
+            taskId=task_id,
+            uploadKind=upload_kind,
+            elapsedMs=round((time.perf_counter() - started) * 1000, 1),
+        )
+        async with AsyncSessionLocal() as db:
+            job = await db.get(AsyncJobModel, job_id)
+            if job:
+                job.status = "failed"
+                job.progress_text = "异步批阅处理失败"
+                job.error_detail = str(exc)
+                job.finished_at = utc_now_iso()
+                await db.commit()
+    finally:
+        job_supervisor.mark_finished(job_id)
+
+
+async def execute_daily_evaluation_job(job_id: str, child_id: str, eval_date: str) -> None:
+    started = time.perf_counter()
+    job_supervisor.mark_started(job_id)
+    try:
+        async with AsyncSessionLocal() as db:
+            child = await db.get(ChildModel, child_id)
+            if not child:
+                raise RuntimeError("未找到儿童档案")
+
+            t_res = await db.execute(
+                select(TaskModel).where(
+                    TaskModel.child_id == child_id,
+                    TaskModel.task_date == eval_date,
+                )
+            )
+            day_tasks = list(t_res.scalars().all())
+            completed_tasks = [t for t in day_tasks if t.status == "completed"]
+            if not completed_tasks:
+                raise RuntimeError("当日尚无已完成的学习任务，无法生成每日总评")
+
+            m_res = await db.execute(
+                select(MistakeModel).where(
+                    MistakeModel.child_id == child_id,
+                    MistakeModel.task_id.in_([t.id for t in day_tasks]),
+                )
+            )
+            day_mistakes = list(m_res.scalars().all())
+
+            await update_job_progress(
+                job_id,
+                "dsh_running",
+                f"正在由 {child.display_name} 专属 DSH 智能体复盘全天任务与错题记忆并撰写总评...",
+            )
+
+            summary_payload = [
+                {
+                    "title": t.title,
+                    "subject": t.subject,
+                    "status": t.status,
+                    "plannedMin": round(t.planned_duration_sec / 60, 1),
+                    "actualMin": round(t.actual_duration_sec / 60, 1),
+                    "pauseCount": t.pause_count,
+                    "initialScore": t.initial_score,
+                    "earnedScore": t.earned_score,
+                    "revisionCount": t.revision_count,
+                    "childVoiceSummary": t.summary_voice_text,
+                }
+                for t in day_tasks
+            ]
+            mistakes_payload = [
+                {
+                    "questionTitle": m.question_title,
+                    "errorCause": m.error_cause,
+                    "masteryStatus": m.mastery_status,
+                }
+                for m in day_mistakes
+            ]
+
+            prompt = (
+                f"任务类型：生成 {eval_date} 每日综合100分制评分与伴读讲评。\n"
+                f"学生：{child.display_name}（{child.age}岁，{child.grade_label}，生日 {child.birth_date}）。\n"
+                f"今日全部任务数据：{json.dumps(summary_payload, ensure_ascii=False)}\n"
+                f"今日错题与订正数据：{json.dumps(mistakes_payload, ensure_ascii=False)}\n\n"
+                "请先读取并更新当前目录下的 `MEMORY.md`（记录今日总体表现与长期成长趋势）。\n"
+                "按 100 分制四维评分（completion 0-30, focus 0-25, quality 0-30, habit 0-15，四项之和等于 totalScore），"
+                "并输出严格纯 JSON 对象：\n"
+                "{\n"
+                '  "totalScore": 94,\n'
+                '  "dimensionScores": {"completion": 30, "focus": 23, "quality": 27, "habit": 14},\n'
+                '  "badgeRank": "SSR 或 SR 或 A 或 B",\n'
+                '  "badgeTitle": "如 闪耀星莓小女王 / 四年级魔法优等星",\n'
+                '  "childCommentarySentences": [\n'
+                f'    "第一句：亲切呼唤{child.display_name}并公布今日总分与荣誉称号",\n'
+                '    "第二句：具体表扬今天某项作业或主动订正错题的高光表现",\n'
+                '    "第三句：温和点出1个小细节改进建议",\n'
+                '    "第四句：充满期待的明日小约定"\n'
+                "  ],\n"
+                '  "parentSummary": "给家长看的客观学情汇总（完成率、有效专注时长、错题掌握度）",\n'
+                '  "weakPoints": ["今日暴露的具体薄弱知识点1"],\n'
+                '  "tomorrowTips": ["明日可执行复习建议1", "明日习惯建议2"]\n'
+                "}"
+            )
+
+            eval_out, new_session_id = await run_supervised_dsh_task(
+                child,
+                task_kind="daily_eval",
+                task_prompt=prompt,
+            )
+            if new_session_id:
+                child.dsh_tutor_session_id = new_session_id
+
+            sentences = [str(s) for s in (eval_out.get("childCommentarySentences") or [])]
+            if not sentences:
+                sentences = [f"{child.display_name}，今天你认真完成了学习任务，继续加油哦！"]
+
+            tts_key: str | None = None
+
+            watermark_iso = max((t.updated_at for t in day_tasks), default=utc_now_iso())
+            dims = eval_out.get("dimensionScores") or {
+                "completion": 28,
+                "focus": 22,
+                "quality": 26,
+                "habit": 14,
+            }
+            total_score = max(0, min(100, int(eval_out.get("totalScore", sum(dims.values())))))
+
+            ex_res = await db.execute(
+                select(DailyEvalModel).where(
+                    DailyEvalModel.child_id == child_id,
+                    DailyEvalModel.eval_date == eval_date,
+                )
+            )
+            existing_eval = ex_res.scalar_one_or_none()
+            now_iso = utc_now_iso()
+
+            if existing_eval:
+                existing_eval.total_score = total_score
+                existing_eval.dimension_scores_json = json.dumps(dims, ensure_ascii=False)
+                existing_eval.badge_rank = str(eval_out.get("badgeRank") or "SR")
+                existing_eval.badge_title = str(eval_out.get("badgeTitle") or "星莓优等星")
+                existing_eval.child_sentences_json = json.dumps(sentences, ensure_ascii=False)
+                existing_eval.tts_minio_key = tts_key
+                existing_eval.parent_summary = str(eval_out.get("parentSummary") or "")
+                existing_eval.weak_points_json = json.dumps(eval_out.get("weakPoints") or [], ensure_ascii=False)
+                existing_eval.tomorrow_tips_json = json.dumps(eval_out.get("tomorrowTips") or [], ensure_ascii=False)
+                existing_eval.dsh_session_id = new_session_id
+                existing_eval.evaluated_watermark_iso = watermark_iso
+                existing_eval.updated_at = now_iso
+            else:
+                db.add(
+                    DailyEvalModel(
+                        id=f"eval-{uuid.uuid4().hex[:12]}",
+                        child_id=child_id,
+                        eval_date=eval_date,
+                        total_score=total_score,
+                        dimension_scores_json=json.dumps(dims, ensure_ascii=False),
+                        badge_rank=str(eval_out.get("badgeRank") or "SR"),
+                        badge_title=str(eval_out.get("badgeTitle") or "星莓优等星"),
+                        child_sentences_json=json.dumps(sentences, ensure_ascii=False),
+                        tts_minio_key=tts_key,
+                        parent_summary=str(eval_out.get("parentSummary") or ""),
+                        weak_points_json=json.dumps(eval_out.get("weakPoints") or [], ensure_ascii=False),
+                        tomorrow_tips_json=json.dumps(eval_out.get("tomorrowTips") or [], ensure_ascii=False),
+                        dsh_session_id=new_session_id,
+                        evaluated_watermark_iso=watermark_iso,
+                        updated_at=now_iso,
+                    )
+                )
+
+            job = await db.get(AsyncJobModel, job_id)
+            if job:
+                job.status = "succeeded"
+                job.progress_text = "今日综合评分与语音讲评已生成！"
+                job.result_json = json.dumps({"totalScore": total_score}, ensure_ascii=False)
+                job.finished_at = now_iso
+
+            await db.commit()
+            log_event(
+                "daily_eval.succeeded",
+                f"每日总评生成完成: {eval_date} ({total_score}分)",
+                jobId=job_id,
+                childId=child_id,
+                evalDate=eval_date,
+                totalScore=total_score,
+                badgeRank=str(eval_out.get("badgeRank") or "SR"),
+                elapsedMs=round((time.perf_counter() - started) * 1000, 1),
+            )
+    except Exception as exc:
+        log_error(
+            "daily_eval.failed",
+            f"每日总评生成失败 ({child_id} @ {eval_date})",
+            exc=exc,
+            jobId=job_id,
+            childId=child_id,
+            evalDate=eval_date,
+            elapsedMs=round((time.perf_counter() - started) * 1000, 1),
+        )
+        async with AsyncSessionLocal() as db:
+            job = await db.get(AsyncJobModel, job_id)
+            if job:
+                job.status = "failed"
+                job.progress_text = "生成每日总评失败"
+                job.error_detail = str(exc)
+                job.finished_at = utc_now_iso()
+                await db.commit()
+    finally:
+        job_supervisor.mark_finished(job_id)

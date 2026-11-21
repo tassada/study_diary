@@ -1,0 +1,11 @@
+{
+  "appId": "app.studydiary.companion",
+  "appName": "星莓伴学",
+  "webDir": "dist",
+  "ios": {
+    "contentInset": "never",
+    "backgroundColor": "#FAF4EC",
+    "limitsNavigationsToAppBoundDomains": false,
+    "preferredContentMode": "desktop"
+  }
+}
