@@ -12,6 +12,15 @@ import { compressImageForModel, studyApi } from '../services/apiClient'
 import { pixelAudio } from '../services/pixelAudio'
 import type { AsyncJobInfo, DictionaryEntry, DictionaryLookup } from '../types/study'
 
+import {
+  canvasToJpegBlob,
+  compositePixelBakedDictionaryCanvas,
+  findHitBoxId,
+  normalizeBoxCoords,
+  rotateCanvas90Cw,
+  type DictionaryAnnotation,
+} from '../utils/dictionaryCanvas'
+
 interface DictionaryModalProps {
   childId: string
   girlName: string
@@ -34,13 +43,13 @@ export function DictionaryModal({
 }: DictionaryModalProps) {
   const recorder = usePixelVoiceRecorder()
   const [viewTab, setViewTab] = useState<'paint' | 'result' | 'history'>('paint')
-  const [tool, setTool] = useState<'brush' | 'eraser'>('brush')
+  const [tool, setTool] = useState<'box' | 'brush' | 'eraser'>('box')
   const [brushIdx, setBrushIdx] = useState<number>(1)
 
-  const [photoFile, setPhotoFile] = useState<File | null>(null)
-  const [photoUrl, setPhotoUrl] = useState<string | null>(null)
+  const [hasPhoto, setHasPhoto] = useState(false)
   const [imgSize, setImgSize] = useState<{ w: number; h: number }>({ w: 0, h: 0 })
-  const [hasMaskPixels, setHasMaskPixels] = useState(false)
+  const [regionCount, setRegionCount] = useState(0)
+  const [actionCount, setActionCount] = useState(0)
 
   const [instruction, setInstruction] = useState('')
   const [voiceBusy, setVoiceBusy] = useState(false)
@@ -53,9 +62,12 @@ export function DictionaryModal({
   const [errorMsg, setErrorMsg] = useState<string | null>(null)
 
   const visibleCanvasRef = useRef<HTMLCanvasElement | null>(null)
-  const maskBufferRef = useRef<HTMLCanvasElement | null>(null)
+  const baseImageCanvasRef = useRef<HTMLCanvasElement | null>(null)
+  const actionsRef = useRef<DictionaryAnnotation[]>([])
+  const draftBoxRef = useRef<[number, number, number, number] | null>(null)
+  const boxAnchorRef = useRef<{ x: number; y: number } | null>(null)
+  const activeStrokeIdRef = useRef<string | null>(null)
   const drawingRef = useRef(false)
-  const lastPointRef = useRef<{ x: number; y: number } | null>(null)
   const activeAudioRef = useRef<HTMLAudioElement | null>(null)
 
   const stopWordAudio = useCallback(() => {
@@ -69,11 +81,8 @@ export function DictionaryModal({
   useEffect(() => {
     return () => {
       stopWordAudio()
-      if (photoUrl) {
-        URL.revokeObjectURL(photoUrl)
-      }
     }
-  }, [photoUrl, stopWordAudio])
+  }, [stopWordAudio])
 
   const loadHistory = useCallback(async () => {
     setLoadingHistory(true)
@@ -91,41 +100,26 @@ export function DictionaryModal({
     void loadHistory()
   }, [loadHistory])
 
-  const syncVisibleCanvasFromBuffer = useCallback(() => {
+  const redrawVisibleCanvas = useCallback(() => {
     const vis = visibleCanvasRef.current
-    const buf = maskBufferRef.current
-    if (!vis || !buf || buf.width === 0 || buf.height === 0) return
-    if (vis.width !== buf.width || vis.height !== buf.height) {
-      vis.width = buf.width
-      vis.height = buf.height
-    }
-    const ctx = vis.getContext('2d')
-    if (!ctx) return
-    ctx.clearRect(0, 0, vis.width, vis.height)
-    ctx.drawImage(buf, 0, 0)
+    const base = baseImageCanvasRef.current
+    if (!vis || !base || base.width === 0 || base.height === 0) return []
+    const regions = compositePixelBakedDictionaryCanvas(
+      vis,
+      base,
+      actionsRef.current,
+      draftBoxRef.current,
+    )
+    setRegionCount(regions.length)
+    setActionCount(actionsRef.current.length)
+    return regions
   }, [])
 
   useEffect(() => {
-    if (viewTab === 'paint' && imgSize.w > 0) {
-      syncVisibleCanvasFromBuffer()
+    if (viewTab === 'paint' && hasPhoto && imgSize.w > 0) {
+      redrawVisibleCanvas()
     }
-  }, [viewTab, imgSize.w, imgSize.h, syncVisibleCanvasFromBuffer])
-
-  const checkBufferHasInk = (): boolean => {
-    const buf = maskBufferRef.current
-    if (!buf || buf.width === 0 || buf.height === 0) return false
-    const sample = document.createElement('canvas')
-    sample.width = 96
-    sample.height = Math.max(1, Math.round((96 * buf.height) / buf.width))
-    const sctx = sample.getContext('2d')
-    if (!sctx) return false
-    sctx.drawImage(buf, 0, 0, sample.width, sample.height)
-    const data = sctx.getImageData(0, 0, sample.width, sample.height).data
-    for (let i = 3; i < data.length; i += 4) {
-      if (data[i] > 24) return true
-    }
-    return false
-  }
+  }, [viewTab, hasPhoto, imgSize.w, imgSize.h, redrawVisibleCanvas])
 
   const handlePhotoSelected = async (e: ChangeEvent<HTMLInputElement>) => {
     const raw = e.target.files?.[0]
@@ -135,35 +129,54 @@ export function DictionaryModal({
     setErrorMsg(null)
     setPreparingPhoto(true)
     try {
-      const compressed = await compressImageForModel(raw, 1600, 0.88)
-      const nextUrl = URL.createObjectURL(compressed)
-      const dims = await new Promise<{ w: number; h: number }>((resolve, reject) => {
-        const probe = new Image()
-        probe.onload = () => resolve({ w: probe.naturalWidth, h: probe.naturalHeight })
-        probe.onerror = () => reject(new Error('无法读取照片尺寸'))
-        probe.src = nextUrl
-      })
-
-      const off = document.createElement('canvas')
-      off.width = dims.w
-      off.height = dims.h
-      maskBufferRef.current = off
-
-      setPhotoFile(compressed)
-      setPhotoUrl((prev) => {
-        if (prev) URL.revokeObjectURL(prev)
-        return nextUrl
-      })
-      setImgSize(dims)
-      setHasMaskPixels(false)
-      setTool('brush')
-      setViewTab('paint')
-      pixelAudio.playChime('sparkle', soundEnabled)
+      const compressed = await compressImageForModel(raw, 1600, 0.9)
+      const tempUrl = URL.createObjectURL(compressed)
+      try {
+        const loadedImg = await new Promise<HTMLImageElement>((resolve, reject) => {
+          const probe = new Image()
+          probe.onload = () => resolve(probe)
+          probe.onerror = () => reject(new Error('无法读取照片尺寸'))
+          probe.src = tempUrl
+        })
+        const base = document.createElement('canvas')
+        base.width = loadedImg.naturalWidth
+        base.height = loadedImg.naturalHeight
+        const bctx = base.getContext('2d')
+        if (!bctx) {
+          throw new Error('初始化照片画布失败')
+        }
+        bctx.drawImage(loadedImg, 0, 0, base.width, base.height)
+        baseImageCanvasRef.current = base
+        actionsRef.current = []
+        draftBoxRef.current = null
+        setImgSize({ w: base.width, h: base.height })
+        setHasPhoto(true)
+        setRegionCount(0)
+        setActionCount(0)
+        setTool('box')
+        setViewTab('paint')
+        pixelAudio.playChime('sparkle', soundEnabled)
+      } finally {
+        URL.revokeObjectURL(tempUrl)
+      }
     } catch (err) {
       setErrorMsg(err instanceof Error ? err.message : '读取照片失败，请重试')
     } finally {
       setPreparingPhoto(false)
     }
+  }
+
+  const handleRotatePhoto = () => {
+    const base = baseImageCanvasRef.current
+    if (!base || isJobRunning) return
+    const rotated = rotateCanvas90Cw(base)
+    baseImageCanvasRef.current = rotated
+    actionsRef.current = []
+    draftBoxRef.current = null
+    setImgSize({ w: rotated.width, h: rotated.height })
+    setRegionCount(0)
+    setActionCount(0)
+    pixelAudio.playChime('tap', soundEnabled)
   }
 
   const getScaledStrokeWidth = (): number => {
@@ -177,83 +190,132 @@ export function DictionaryModal({
     if (!vis) return null
     const rect = vis.getBoundingClientRect()
     if (rect.width <= 0 || rect.height <= 0) return null
-    const x = ((e.clientX - rect.left) / rect.width) * vis.width
-    const y = ((e.clientY - rect.top) / rect.height) * vis.height
+    const x = Math.max(0, Math.min(vis.width, ((e.clientX - rect.left) / rect.width) * vis.width))
+    const y = Math.max(0, Math.min(vis.height, ((e.clientY - rect.top) / rect.height) * vis.height))
     return { x, y }
   }
 
-  const paintSegment = (from: { x: number; y: number }, to: { x: number; y: number }) => {
-    const buf = maskBufferRef.current
-    if (!buf) return
-    const bctx = buf.getContext('2d')
-    if (!bctx) return
-
-    const strokeW = getScaledStrokeWidth()
-    bctx.save()
-    bctx.lineCap = 'round'
-    bctx.lineJoin = 'round'
-    bctx.lineWidth = strokeW
-    if (tool === 'eraser') {
-      bctx.globalCompositeOperation = 'destination-out'
-      bctx.strokeStyle = 'rgba(0,0,0,1)'
-      bctx.fillStyle = 'rgba(0,0,0,1)'
-    } else {
-      bctx.globalCompositeOperation = 'source-over'
-      bctx.strokeStyle = '#FF3D8B'
-      bctx.fillStyle = '#FF3D8B'
-    }
-
-    bctx.beginPath()
-    bctx.moveTo(from.x, from.y)
-    bctx.lineTo(to.x, to.y)
-    bctx.stroke()
-
-    if (from.x === to.x && from.y === to.y) {
-      bctx.beginPath()
-      bctx.arc(from.x, from.y, strokeW / 2, 0, Math.PI * 2)
-      bctx.fill()
-    }
-    bctx.restore()
-
-    syncVisibleCanvasFromBuffer()
-  }
-
   const handlePointerDown = (e: ReactPointerEvent<HTMLCanvasElement>) => {
-    if (!photoUrl || isJobRunning) return
+    if (!hasPhoto || isJobRunning || !baseImageCanvasRef.current) return
     e.currentTarget.setPointerCapture(e.pointerId)
     const pt = pointerToCanvasCoords(e)
     if (!pt) return
     drawingRef.current = true
-    lastPointRef.current = pt
-    paintSegment(pt, pt)
-    if (tool === 'brush') {
-      setHasMaskPixels(true)
+
+    if (tool === 'box') {
+      boxAnchorRef.current = pt
+      draftBoxRef.current = normalizeBoxCoords(
+        pt.x,
+        pt.y,
+        pt.x,
+        pt.y,
+        baseImageCanvasRef.current.width,
+        baseImageCanvasRef.current.height,
+      )
+      redrawVisibleCanvas()
+      return
     }
+
+    if (tool === 'eraser') {
+      const hitBoxId = findHitBoxId(actionsRef.current, pt, 10)
+      if (hitBoxId) {
+        actionsRef.current = actionsRef.current.filter((a) => a.id !== hitBoxId)
+      }
+    }
+
+    const strokeId = `st-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`
+    activeStrokeIdRef.current = strokeId
+    actionsRef.current = [
+      ...actionsRef.current,
+      {
+        kind: 'stroke',
+        id: strokeId,
+        tool: tool === 'eraser' ? 'eraser' : 'brush',
+        width: getScaledStrokeWidth(),
+        points: [pt],
+      },
+    ]
+    redrawVisibleCanvas()
   }
 
   const handlePointerMove = (e: ReactPointerEvent<HTMLCanvasElement>) => {
-    if (!drawingRef.current || !lastPointRef.current) return
+    if (!drawingRef.current || !baseImageCanvasRef.current) return
     const pt = pointerToCanvasCoords(e)
     if (!pt) return
-    paintSegment(lastPointRef.current, pt)
-    lastPointRef.current = pt
+
+    if (tool === 'box' && boxAnchorRef.current) {
+      draftBoxRef.current = normalizeBoxCoords(
+        boxAnchorRef.current.x,
+        boxAnchorRef.current.y,
+        pt.x,
+        pt.y,
+        baseImageCanvasRef.current.width,
+        baseImageCanvasRef.current.height,
+      )
+      redrawVisibleCanvas()
+      return
+    }
+
+    if (tool === 'eraser') {
+      const hitBoxId = findHitBoxId(actionsRef.current, pt, 10)
+      if (hitBoxId) {
+        actionsRef.current = actionsRef.current.filter((a) => a.id !== hitBoxId)
+      }
+    }
+
+    const activeId = activeStrokeIdRef.current
+    if (!activeId) return
+    const list = actionsRef.current
+    const idx = list.findIndex((a) => a.id === activeId)
+    if (idx >= 0 && list[idx].kind === 'stroke') {
+      const target = list[idx]
+      target.points.push(pt)
+      redrawVisibleCanvas()
+    }
   }
 
   const handlePointerUp = () => {
     if (!drawingRef.current) return
     drawingRef.current = false
-    lastPointRef.current = null
-    setHasMaskPixels(checkBufferHasInk())
+
+    if (tool === 'box') {
+      const box = draftBoxRef.current
+      draftBoxRef.current = null
+      boxAnchorRef.current = null
+      if (box && box[2] - box[0] >= 10 && box[3] - box[1] >= 10) {
+        actionsRef.current = [
+          ...actionsRef.current,
+          {
+            kind: 'box',
+            id: `bx-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+            x1: box[0],
+            y1: box[1],
+            x2: box[2],
+            y2: box[3],
+          },
+        ]
+        pixelAudio.playChime('tap', soundEnabled)
+      }
+      redrawVisibleCanvas()
+      return
+    }
+
+    activeStrokeIdRef.current = null
+    redrawVisibleCanvas()
+  }
+
+  const handleUndo = () => {
+    if (actionsRef.current.length === 0 || isJobRunning) return
+    actionsRef.current = actionsRef.current.slice(0, -1)
+    draftBoxRef.current = null
+    redrawVisibleCanvas()
+    pixelAudio.playChime('tap', soundEnabled)
   }
 
   const handleClearMask = () => {
-    const buf = maskBufferRef.current
-    if (buf) {
-      const ctx = buf.getContext('2d')
-      ctx?.clearRect(0, 0, buf.width, buf.height)
-    }
-    syncVisibleCanvasFromBuffer()
-    setHasMaskPixels(false)
+    actionsRef.current = []
+    draftBoxRef.current = null
+    redrawVisibleCanvas()
     pixelAudio.playChime('tap', soundEnabled)
   }
 
@@ -308,36 +370,37 @@ export function DictionaryModal({
   }, [activeJob, isJobRunning, loadHistory, soundEnabled])
 
   const handleSubmitLookup = async () => {
-    if (!photoFile || !maskBufferRef.current || isJobRunning) return
-    if (!checkBufferHasInk()) {
-      setErrorMsg('还没有涂抹要查的字词哦！请先选画笔在照片文字上涂一下')
+    const base = baseImageCanvasRef.current
+    if (!hasPhoto || !base || isJobRunning) return
+
+    draftBoxRef.current = null
+    const exportCanvas = document.createElement('canvas')
+    const regions = compositePixelBakedDictionaryCanvas(
+      exportCanvas,
+      base,
+      actionsRef.current,
+      null,
+    )
+    redrawVisibleCanvas()
+
+    if (regions.length === 0) {
+      setErrorMsg('还没有标记要查的字词哦！请用「⬜ 画框」圈住或用「🖍️ 涂色」涂在目标字词上')
       return
     }
+
     setErrorMsg(null)
     try {
-      const exportCanvas = document.createElement('canvas')
-      const maxMaskEdge = 900
-      const longest = Math.max(maskBufferRef.current.width, maskBufferRef.current.height)
-      const ratio = longest > maxMaskEdge ? maxMaskEdge / longest : 1
-      exportCanvas.width = Math.max(1, Math.round(maskBufferRef.current.width * ratio))
-      exportCanvas.height = Math.max(1, Math.round(maskBufferRef.current.height * ratio))
-      const ectx = exportCanvas.getContext('2d')
-      ectx?.drawImage(maskBufferRef.current, 0, 0, exportCanvas.width, exportCanvas.height)
+      const [rawPhotoBlob, annotatedPhotoBlob] = await Promise.all([
+        canvasToJpegBlob(base, 0.88),
+        canvasToJpegBlob(exportCanvas, 0.88),
+      ])
 
-      const maskBlob = await new Promise<Blob | null>((resolve) =>
-        exportCanvas.toBlob((b) => resolve(b), 'image/png'),
-      )
-      if (!maskBlob) {
-        setErrorMsg('生成涂抹蒙版失败，请重试')
-        return
-      }
-
-      const job = await studyApi.submitDictionaryLookup(
-        childId,
-        photoFile,
-        maskBlob,
-        instruction.trim(),
-      )
+      const job = await studyApi.submitDictionaryLookup(childId, {
+        rawPhotoBlob,
+        annotatedPhotoBlob,
+        regions1000: regions.map((r) => r.box1000),
+        instruction: instruction.trim(),
+      })
       setActiveJob(job)
       pixelAudio.playChime('sparkle', soundEnabled)
     } catch (err) {
@@ -383,20 +446,20 @@ export function DictionaryModal({
             )}
             <div>
               <div className="inline-block bg-[#FFE484] border-2 border-[#4A2B44] rounded px-2.5 py-0.5 text-[13px] font-extrabold text-[#332230] mb-1">
-                涂抹处 #{entry.regionIndex} · 无法辨认
+                标记处 #{entry.regionIndex} · 无法辨认
               </div>
               <div className="text-[19px] font-extrabold text-[#7A4B00]">
-                🤔 {entry.unrecognizedReason || '这处涂抹实在猜不出是什么字词哦'}
+                🤔 {entry.unrecognizedReason || '这处标记实在猜不出是什么字词哦'}
               </div>
             </div>
           </div>
-          {photoUrl && (
+          {hasPhoto && (
             <button
               type="button"
               onClick={() => setViewTab('paint')}
               className="pixel-btn bg-[#FFFDF9] px-4 py-2 text-[15px] font-extrabold shrink-0"
             >
-              🖌️ 返回擦掉重涂
+              ⬜ 返回重标
             </button>
           )}
         </div>
@@ -634,7 +697,7 @@ export function DictionaryModal({
                 星莓中英双解字典 — {girlName}
               </h2>
               <p className="text-[14px] font-semibold text-[#5C4056]">
-                拍照后用荧光画笔涂出要查的字词（可一次涂多处），点喇叭只读被查词本身
+                支持「⬜ 画框」精准圈词或「🖍️ 涂色」荧光标记，直接写入图像像素交由多模态解析
               </p>
             </div>
           </div>
@@ -647,7 +710,7 @@ export function DictionaryModal({
                 viewTab === 'paint' ? 'bg-[#FFE484]' : 'bg-[#FFFDF9]'
               }`}
             >
-              🖌️ 拍照涂字
+              ⬜ 画框/涂色
             </button>
             <button
               type="button"
@@ -704,8 +767,8 @@ export function DictionaryModal({
           <div className="flex-1 min-h-0 grid grid-cols-12 gap-4 pt-3.5">
             <div className="col-span-8 pixel-card p-3.5 flex flex-col justify-between min-h-0">
               <div className="flex items-center justify-between gap-2 pb-2.5 border-b border-[#EAD6E2] shrink-0 flex-wrap">
-                <div className="flex items-center gap-2">
-                  <label className="pixel-btn bg-[#EC5F9B] text-white px-3.5 py-1.5 text-[15px] font-extrabold cursor-pointer">
+                <div className="flex items-center gap-1.5 flex-wrap">
+                  <label className="pixel-btn bg-[#EC5F9B] text-white px-3 py-1.5 text-[14px] font-extrabold cursor-pointer">
                     <span>📷 拍照</span>
                     <input
                       type="file"
@@ -716,8 +779,8 @@ export function DictionaryModal({
                       className="hidden"
                     />
                   </label>
-                  <label className="pixel-btn bg-[#FFFDF9] text-[#332230] px-3.5 py-1.5 text-[15px] font-extrabold cursor-pointer">
-                    <span>🖼️ 从相册选图</span>
+                  <label className="pixel-btn bg-[#FFFDF9] text-[#332230] px-3 py-1.5 text-[14px] font-extrabold cursor-pointer">
+                    <span>🖼️ 选图</span>
                     <input
                       type="file"
                       accept="image/*"
@@ -726,45 +789,73 @@ export function DictionaryModal({
                       className="hidden"
                     />
                   </label>
+                  {hasPhoto && (
+                    <button
+                      type="button"
+                      disabled={isJobRunning}
+                      onClick={handleRotatePhoto}
+                      className="pixel-btn bg-[#FFFDF9] px-2.5 py-1.5 text-[13px] font-extrabold text-[#332230]"
+                    >
+                      ↻ 旋转90°
+                    </button>
+                  )}
                 </div>
 
-                {photoUrl && (
-                  <div className="flex items-center gap-1.5">
+                {hasPhoto && (
+                  <div className="flex items-center gap-1.5 flex-wrap">
+                    <button
+                      type="button"
+                      onClick={() => setTool('box')}
+                      className={`pixel-btn px-3 py-1.5 text-[14px] font-extrabold ${
+                        tool === 'box' ? 'bg-[#E11D48] text-white' : 'bg-[#FFFDF9]'
+                      }`}
+                    >
+                      ⬜ 画框
+                    </button>
                     <button
                       type="button"
                       onClick={() => setTool('brush')}
                       className={`pixel-btn px-3 py-1.5 text-[14px] font-extrabold ${
-                        tool === 'brush' ? 'bg-[#EC5F9B] text-white' : 'bg-[#FFFDF9]'
+                        tool === 'brush' ? 'bg-[#FFE484] text-[#332230]' : 'bg-[#FFFDF9]'
                       }`}
                     >
-                      🖌️ 画笔涂字
+                      🖍️ 涂色
                     </button>
                     <button
                       type="button"
                       onClick={() => setTool('eraser')}
-                      className={`pixel-btn px-3 py-1.5 text-[14px] font-extrabold ${
+                      className={`pixel-btn px-2.5 py-1.5 text-[14px] font-extrabold ${
                         tool === 'eraser' ? 'bg-[#2563EB] text-white' : 'bg-[#FFFDF9]'
                       }`}
                     >
-                      🧽 橡皮擦
+                      🧽 橡皮
                     </button>
                     <button
                       type="button"
-                      onClick={handleClearMask}
-                      className="pixel-btn bg-[#FFFDF9] px-3 py-1.5 text-[14px] font-bold text-[#8E3B63]"
+                      disabled={actionCount === 0 || isJobRunning}
+                      onClick={handleUndo}
+                      className="pixel-btn bg-[#FFFDF9] px-2.5 py-1.5 text-[13px] font-bold text-[#332230]"
                     >
-                      🗑️ 清空重涂
+                      ↩️ 撤销
+                    </button>
+                    <button
+                      type="button"
+                      disabled={actionCount === 0 || isJobRunning}
+                      onClick={handleClearMask}
+                      className="pixel-btn bg-[#FFFDF9] px-2.5 py-1.5 text-[13px] font-bold text-[#8E3B63]"
+                    >
+                      🗑️ 清空
                     </button>
                   </div>
                 )}
               </div>
 
               <div className="flex-1 min-h-0 bg-[#FAF4EC] border-2 border-[#4A2B44] rounded my-2.5 flex items-center justify-center overflow-hidden p-2">
-                {!photoUrl ? (
+                {!hasPhoto ? (
                   <div className="text-center space-y-4 p-6">
                     <div className="text-5xl">📷📖</div>
                     <div className="text-[21px] font-extrabold text-[#332230]">
-                      拍下课本或绘本页面，手指一涂就能查字词！
+                      拍下课本或绘本页面，画框或涂色就能精准查字词！
                     </div>
                     <div className="flex items-center justify-center gap-4 pt-1">
                       <label className="pixel-btn bg-[#EC5F9B] text-white px-6 py-3 text-[18px] font-extrabold cursor-pointer">
@@ -789,56 +880,56 @@ export function DictionaryModal({
                     </div>
                   </div>
                 ) : (
-                  <div className="relative inline-flex items-center justify-center max-w-full max-h-full">
-                    <img
-                      src={photoUrl}
-                      alt="待查词原图"
-                      draggable={false}
-                      className="block max-w-full max-h-[455px] w-auto h-auto object-contain select-none pointer-events-none rounded"
-                    />
-                    <canvas
-                      ref={visibleCanvasRef}
-                      width={imgSize.w}
-                      height={imgSize.h}
-                      onPointerDown={handlePointerDown}
-                      onPointerMove={handlePointerMove}
-                      onPointerUp={handlePointerUp}
-                      onPointerCancel={handlePointerUp}
-                      className="absolute inset-0 w-full h-full touch-none opacity-45 cursor-crosshair rounded"
-                    />
-                  </div>
+                  <canvas
+                    ref={visibleCanvasRef}
+                    width={imgSize.w}
+                    height={imgSize.h}
+                    onPointerDown={handlePointerDown}
+                    onPointerMove={handlePointerMove}
+                    onPointerUp={handlePointerUp}
+                    onPointerCancel={handlePointerUp}
+                    className="block max-w-full max-h-[455px] w-auto h-auto touch-none select-none cursor-crosshair rounded shadow-sm"
+                  />
                 )}
               </div>
 
-              <div className="flex items-center justify-between gap-2 shrink-0">
-                <div className="flex items-center gap-2">
-                  <span className="text-[14px] font-extrabold text-[#332230]">
-                    {tool === 'eraser' ? '橡皮大小：' : '画笔粗细：'}
-                  </span>
-                  {BRUSH_PRESETS.map((bp, idx) => (
-                    <button
-                      key={bp.id}
-                      type="button"
-                      onClick={() => setBrushIdx(idx)}
-                      className={`pixel-btn px-3 py-1 text-[13px] font-extrabold inline-flex items-center gap-1.5 ${
-                        brushIdx === idx ? 'bg-[#FFE484]' : 'bg-[#FFFDF9]'
-                      }`}
-                    >
-                      <span
-                        className="inline-block rounded-full border border-[#4A2B44]"
-                        style={{
-                          width: `${bp.dotPx}px`,
-                          height: `${bp.dotPx}px`,
-                          backgroundColor: tool === 'eraser' ? '#FFFFFF' : '#FF3D8B',
-                        }}
-                      />
-                      <span>{bp.label}</span>
-                    </button>
-                  ))}
-                </div>
+              <div className="flex items-center justify-between gap-2 shrink-0 flex-wrap">
+                {tool === 'box' ? (
+                  <div className="text-[13px] font-extrabold text-[#9F1239] bg-[#FFF0F3] border border-[#E11D48] rounded px-3 py-1">
+                    ⬜ 推荐精准模式：按住拖动红框圈住单词、词语或整句话（零偏移写入图像像素）
+                  </div>
+                ) : (
+                  <div className="flex items-center gap-2">
+                    <span className="text-[14px] font-extrabold text-[#332230]">
+                      {tool === 'eraser' ? '橡皮大小：' : '荧光笔粗细：'}
+                    </span>
+                    {BRUSH_PRESETS.map((bp, idx) => (
+                      <button
+                        key={bp.id}
+                        type="button"
+                        onClick={() => setBrushIdx(idx)}
+                        className={`pixel-btn px-3 py-1 text-[13px] font-extrabold inline-flex items-center gap-1.5 ${
+                          brushIdx === idx ? 'bg-[#FFE484]' : 'bg-[#FFFDF9]'
+                        }`}
+                      >
+                        <span
+                          className="inline-block rounded-full border border-[#4A2B44]"
+                          style={{
+                            width: `${bp.dotPx}px`,
+                            height: `${bp.dotPx}px`,
+                            backgroundColor: tool === 'eraser' ? '#FFFFFF' : '#FFE600',
+                          }}
+                        />
+                        <span>{bp.label}</span>
+                      </button>
+                    ))}
+                  </div>
+                )}
 
                 <span className="text-[13px] font-bold text-[#5C4056]">
-                  {hasMaskPixels ? '✅ 已涂抹待查字词（可涂多处）' : '在文字上涂抹即可框定生字词'}
+                  {regionCount > 0
+                    ? `✅ 已精准标记 ${regionCount} 处目标（可继续画框或涂色）`
+                    : '拖动红框或涂抹荧光笔框定要查的内容'}
                 </span>
               </div>
             </div>
@@ -850,14 +941,14 @@ export function DictionaryModal({
                     💬 查词指令（可选）
                   </div>
                   <p className="text-[14px] font-semibold text-[#5C4056] leading-relaxed">
-                    默认自动识别涂抹的所有中英字词并生成完整字典卡；你也可以补充说明：
+                    默认自动识别画框/涂色的字词或句子并生成双解卡片；也可补充要求：
                   </p>
 
                   <textarea
                     rows={3}
                     value={instruction}
                     onChange={(e) => setInstruction(e.target.value)}
-                    placeholder="例如：帮我查涂出来的字词，顺便看看在句子里是什么意思（不填也可以直接查）"
+                    placeholder="例如：帮我查框出来的单词，或者翻译框出来的整句话（不填也可直接查）"
                     className="w-full bg-[#FAF4EC] border-2 border-[#4A2B44] rounded p-2.5 text-[15px] font-medium text-[#332230] resize-none focus:outline-none"
                   />
 
@@ -883,19 +974,21 @@ export function DictionaryModal({
                 </div>
 
                 <div className="bg-[#F6F2FC] border-2 border-[#4A2B44] rounded p-3 text-[13px] font-semibold text-[#4A3346] space-y-1">
-                  <div>📌 支持一次涂多个中文字、词语或英文单词</div>
-                  <div>📌 中文带笔画笔顺、拼音、分项字义、同反义词</div>
-                  <div>📌 英文带音标与双解，点喇叭只读词本身</div>
+                  <div>📌 「⬜ 画框」适合密集排版精准圈词或圈整句</div>
+                  <div>📌 「🖍️ 涂色」适合快速涂抹生字词，可混合多处</div>
+                  <div>📌 点词条旁「🔊」按需标准朗读被查词本身</div>
                 </div>
               </div>
 
               <button
                 type="button"
-                disabled={!photoFile || !hasMaskPixels || isJobRunning}
+                disabled={!hasPhoto || regionCount === 0 || isJobRunning}
                 onClick={() => void handleSubmitLookup()}
                 className="pixel-btn w-full bg-[#52CE9B] text-[#104530] py-3.5 px-5 text-[20px] font-extrabold h-[62px] shrink-0"
               >
-                {isJobRunning ? '⏳ 正在查字典...' : '🔍 开始查涂抹的字词'}
+                {isJobRunning
+                  ? '⏳ 正在解析标记图像...'
+                  : `🔍 查已标记的 ${regionCount > 0 ? `${regionCount} 处` : '字词'}`}
               </button>
             </div>
           </div>

@@ -344,15 +344,18 @@ export const studyApi = {
 
   async submitDictionaryLookup(
     childId: string,
-    rawPhotoFile: File,
-    maskPngBlob: Blob,
-    instruction: string,
+    payload: {
+      rawPhotoBlob: Blob
+      annotatedPhotoBlob: Blob
+      regions1000: Array<[number, number, number, number]>
+      instruction: string
+    },
   ): Promise<AsyncJobInfo> {
-    const normalizedFile = await compressImageForModel(rawPhotoFile, 1600, 0.88)
     const form = new FormData()
-    form.append('instruction', instruction)
-    form.append('image_file', normalizedFile, normalizedFile.name)
-    form.append('mask_file', maskPngBlob, 'mask.png')
+    form.append('instruction', payload.instruction)
+    form.append('regions_json', JSON.stringify(payload.regions1000))
+    form.append('image_file', payload.rawPhotoBlob, 'raw.jpg')
+    form.append('annotated_file', payload.annotatedPhotoBlob, 'annotated.jpg')
     const resp = await fetch(
       apiUrl(`/api/v1/children/${encodeURIComponent(childId)}/dictionary/lookup`),
       {

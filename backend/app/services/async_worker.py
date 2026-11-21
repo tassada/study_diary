@@ -13,16 +13,19 @@ from ..models import (
     TaskModel,
     utc_now_iso,
 )
-from ..providers.deepseek_tools import recognize_image_via_deepseek_ocr
+from ..providers.deepseek_vlm import call_deepseek_vlm_json, call_supervised_vlm_json
+from ..providers.dsh_agent import ensure_child_agent_files
 from ..providers.minio_store import minio_gateway
 from .audit_logger import log_error, log_event
-from .dsh_supervisor import job_supervisor, run_supervised_dsh_task
+from .dsh_supervisor import (
+    audit_dsh_payload_completeness,
+    job_supervisor,
+    run_supervised_dsh_task,
+)
 from .image_pipeline import (
     crop_mistake_region_jpeg,
-    is_likely_sideways_ocr,
     render_mistake_explanation_svg,
     rotate_jpeg_clockwise,
-    score_ocr_uprightness,
 )
 
 
@@ -112,61 +115,56 @@ async def execute_homework_review_job(job_id: str, task_id: str, upload_kind: st
             pending_images = [img for img in all_images if img.ocr_status != "done"]
             total_pending = len(pending_images)
 
+            image_bytes_cache: dict[str, bytes] = {}
+
             for idx, img_row in enumerate(pending_images):
                 await update_job_progress(
                     job_id,
                     "ocr_running",
-                    f"正在用 DeepSeek OCR 识别新上传作业图片 ({idx + 1}/{total_pending})...",
+                    f"DeepSeek-V4.1-Flash 正在直接看图校准方向并审阅作业页 ({idx + 1}/{total_pending})...",
                 )
                 img_bytes, _ = await minio_gateway.get_object_bytes(img_row.minio_key)
-                ocr_out = await recognize_image_via_deepseek_ocr(img_bytes, img_row.file_name)
-                if is_likely_sideways_ocr(ocr_out["boxes"]):
-                    cw_bytes, cw_w, cw_h = rotate_jpeg_clockwise(img_bytes, 90)
-                    ccw_bytes, ccw_w, ccw_h = rotate_jpeg_clockwise(img_bytes, 270)
-                    cw_ocr, ccw_ocr = await asyncio.gather(
-                        recognize_image_via_deepseek_ocr(cw_bytes, img_row.file_name),
-                        recognize_image_via_deepseek_ocr(ccw_bytes, img_row.file_name),
+                orient_prompt = (
+                    "请直接观察这张学生作业照片，完成两件事并输出纯 JSON：\n"
+                    "1. `rotateCw`：判断要让纸面上的印刷文字和手写字恢复【正立正向可读】，需要将当前图片顺时针旋转多少度？只能填 0、90、180 或 270。\n"
+                    "2. `pageTranscript`：完整逐题整理本页内容（包含印刷题干、图形/表格/扑克牌等视觉元素说明，以及学生手写作答的原文与涂改情况）。\n"
+                    '严格输出格式：{"rotateCw": 0, "pageTranscript": "【第1题】..."}'
+                )
+                page_vlm = await call_deepseek_vlm_json(
+                    prompt_text=orient_prompt,
+                    images=[(f"作业照片 {img_row.id}", img_bytes)],
+                    max_tokens=4096,
+                )
+                rot_cw = int(page_vlm.get("rotateCw") or 0) % 360
+                if rot_cw in {90, 180, 270}:
+                    upright_bytes, up_w, up_h = rotate_jpeg_clockwise(img_bytes, rot_cw)
+                    await minio_gateway.put_bytes(img_row.minio_key, upright_bytes, "image/jpeg")
+                    img_row.width = up_w
+                    img_row.height = up_h
+                    img_row.file_size = len(upright_bytes)
+                    image_bytes_cache[img_row.id] = upright_bytes
+                    log_event(
+                        "homework.image_auto_uprighted",
+                        f"DeepSeek-V4.1-Flash 自动顺时针旋转 {rot_cw}° 放正作业图: {img_row.id}",
+                        taskId=task.id,
+                        imageId=img_row.id,
+                        degreesCw=rot_cw,
                     )
-                    base_score = score_ocr_uprightness(ocr_out["boxes"], ocr_out["plain_text"])
-                    cw_score = score_ocr_uprightness(cw_ocr["boxes"], cw_ocr["plain_text"])
-                    ccw_score = score_ocr_uprightness(ccw_ocr["boxes"], ccw_ocr["plain_text"])
-                    if cw_score > base_score + 25.0 and cw_score >= ccw_score:
-                        await minio_gateway.put_bytes(img_row.minio_key, cw_bytes, "image/jpeg")
-                        img_row.width = cw_w
-                        img_row.height = cw_h
-                        img_row.file_size = len(cw_bytes)
-                        ocr_out = cw_ocr
-                        log_event(
-                            "homework.image_auto_uprighted",
-                            f"自动顺时针旋转90°放正横拍作业图: {img_row.id}",
-                            taskId=task.id,
-                            imageId=img_row.id,
-                            degreesCw=90,
-                        )
-                    elif ccw_score > base_score + 25.0:
-                        await minio_gateway.put_bytes(img_row.minio_key, ccw_bytes, "image/jpeg")
-                        img_row.width = ccw_w
-                        img_row.height = ccw_h
-                        img_row.file_size = len(ccw_bytes)
-                        ocr_out = ccw_ocr
-                        log_event(
-                            "homework.image_auto_uprighted",
-                            f"自动逆时针旋转90°放正横拍作业图: {img_row.id}",
-                            taskId=task.id,
-                            imageId=img_row.id,
-                            degreesCw=270,
-                        )
+                else:
+                    image_bytes_cache[img_row.id] = img_bytes
+
+                transcript_str = str(page_vlm.get("pageTranscript") or "").strip()
                 img_row.ocr_status = "done"
-                img_row.ocr_raw_text = ocr_out["raw_text"]
-                img_row.ocr_plain_text = ocr_out["plain_text"]
-                img_row.ocr_boxes_json = json.dumps(ocr_out["boxes"], ensure_ascii=False)
+                img_row.ocr_raw_text = transcript_str
+                img_row.ocr_plain_text = transcript_str
+                img_row.ocr_boxes_json = "[]"
                 img_row.ocr_processed_at = utc_now_iso()
                 await db.commit()
 
             await update_job_progress(
                 job_id,
                 "dsh_running",
-                f"正在唤起 {child.display_name} 专属 DSH 智能体批阅作业、核对记忆并生成错题精讲...",
+                f"DeepSeek-V4.1-Flash 多模态正在结合 {child.display_name} 长期记忆直接看卷批阅与定位错题...",
             )
 
             mistake_res = await db.execute(
@@ -174,15 +172,24 @@ async def execute_homework_review_job(job_id: str, task_id: str, upload_kind: st
             )
             existing_mistakes = list(mistake_res.scalars().all())
 
-            ocr_pages_payload = []
+            vlm_pages: list[tuple[str, bytes]] = []
+            pages_meta_payload = []
             for p_idx, img_row in enumerate(all_images):
-                ocr_pages_payload.append(
+                if img_row.id not in image_bytes_cache:
+                    raw_b, _ = await minio_gateway.get_object_bytes(img_row.minio_key)
+                    image_bytes_cache[img_row.id] = raw_b
+                vlm_pages.append(
+                    (
+                        f"第 {p_idx + 1} 页原卷（imageId={img_row.id}, 类型={img_row.upload_kind}）",
+                        image_bytes_cache[img_row.id],
+                    )
+                )
+                pages_meta_payload.append(
                     {
                         "pageNo": p_idx + 1,
                         "imageId": img_row.id,
                         "uploadKind": img_row.upload_kind,
-                        "ocrRawWithBoxes": img_row.ocr_raw_text[:4000],
-                        "ocrPlainText": img_row.ocr_plain_text[:2500],
+                        "visualNotes": img_row.ocr_plain_text[:2500],
                     }
                 )
 
@@ -197,31 +204,40 @@ async def execute_homework_review_job(job_id: str, task_id: str, upload_kind: st
                 if m.mastery_status == "open"
             ]
 
-            dsh_prompt = (
-                f"任务类型：作业批阅、单任务100分制打分与错题精讲（上传模式：{upload_kind}）。\n"
+            ws_dir = ensure_child_agent_files(child)
+            memory_file = ws_dir / "MEMORY.md"
+            mistakes_jsonl_file = ws_dir / "mistakes.jsonl"
+            memory_excerpt = (
+                memory_file.read_text(encoding="utf-8")[:2500] if memory_file.exists() else ""
+            )
+
+            vlm_review_prompt = (
+                f"你是温暖、严谨的小学伴学导师「海星老师 Stella」。请直接查看上方传入的 {len(vlm_pages)} 张已放正的学生作业原卷图片进行多模态批阅（上传模式：{upload_kind}）。\n"
                 f"学生：{child.display_name}（{child.age}岁，{child.grade_label}）。\n"
                 f"作业标题：{task.title}（学科：{task.subject}，难度：{task.difficulty}星）。\n"
                 f"计时表现：计划 {round(task.planned_duration_sec / 60, 1)} 分钟，实际专注 {round(task.actual_duration_sec / 60, 1)} 分钟，暂停 {task.pause_count} 次。\n"
                 f"孩子语音自述：「{task.summary_voice_text or '已认真完成作业'}」\n"
                 f"历史首次得分：{task.initial_score}，当前得分：{task.earned_score}。\n"
-                f"全部作业页 DeepSeek OCR 结果（含 0-1000 归一化 <｜box｜> 坐标）：\n{json.dumps(ocr_pages_payload, ensure_ascii=False)}\n"
+                f"学生长期学情记忆摘要（MEMORY.md）：\n{memory_excerpt}\n"
+                f"各页辅助梳理摘要：{json.dumps(pages_meta_payload, ensure_ascii=False)}\n"
                 f"本任务待订正旧错题：{json.dumps(open_mistakes_payload, ensure_ascii=False)}\n\n"
-                "请先结合当前目录下的 `MEMORY.md` 和 `mistakes.jsonl` 检查孩子的薄弱点，把本次新发现的知识薄弱点或已订正攻克情况更新写入 `MEMORY.md` 和 `mistakes.jsonl`。\n"
-                "注意评分与错题规则：\n"
-                "1. 本任务采用独立 100 分制（专注30 + 完整度30 + 准确率40）。若 uploadKind 为 correction（错题订正重传）且新图片证实改对了旧错题，允许在原分基础上追回最高 80% 的扣分（不超过98分），并把对应 mistakeId 列入 masteredMistakeIds。\n"
-                "2. 请仔细检查 OCR 识别出的算式、生字、单词或句子是否有错题、涂改易错点或步骤缺失；若有错题（或值得重点点拨的薄弱题），请在 newMistakes 中给出详细分步讲解、原图对应的 imageId 与 [x1,y1,x2,y2] (0-1000坐标)，并出一道同类型四年级巩固练习题。\n"
-                "3. quickPraise 必须是首尾完整、独立可读的总结评语（先肯定做对亮点，再点明核心改进结论与鼓励收尾），严禁写成“我们一道一道来！”“下面一起来看看”等未说完的悬空引子。\n"
-                "最后请严格只输出一个纯 JSON 对象，格式如下：\n"
+                "注意批阅与错题定位规则：\n"
+                "1. 本任务采用独立 100 分制（专注30 + 完整度30 + 准确率40）。若 uploadKind 为 correction（错题订正重传）且新上传照片上明确改对了旧错题，允许在原分基础上追回最高 80% 的扣分（不超过98分），并把对应 mistakeId 列入 masteredMistakeIds。\n"
+                "2. 请直接看原图上的印刷题目、图表/图形/扑克牌/表格以及孩子手写答案，逐题核算真伪！发现错题、漏写过程或易错点时，在 newMistakes 中给出原图对应的 `imageId` 与该道题在正立原图上的 0-1000 归一化框坐标 `box: [x1, y1, x2, y2]`（把整道小题题干与学生手写答案完整框住），并配分步解析与一道同类巩固练习题。\n"
+                "3. `quickPraise` 必须是首尾完整、独立可读的总结评语（先肯定做对亮点，再点明具体改进结论与鼓励收尾），严禁出现“我们一道一道来！”“下面一起来看看”等半截悬空结尾。\n"
+                "4. `memoryNote` 写一句简练的本次学情观察（用于追加记录到孩子的长期记忆档案）。\n"
+                "最后请严格只输出一个纯 JSON 对象：\n"
                 "{\n"
                 '  "score": 92,\n'
                 '  "quickPraise": "海星老师首尾完整、独立自洽的总结夸奖与改进点拨（70-130字，句意闭合完整）",\n'
+                '  "memoryNote": "一句话记录本次作业暴露的知识点掌握与薄弱项",\n'
                 '  "masteredMistakeIds": [],\n'
                 '  "newMistakes": [\n'
                 "    {\n"
                 '      "imageId": "对应图片imageId",\n'
                 '      "box": [60, 350, 920, 560],\n'
                 '      "questionTitle": "错题/易错题简短标题",\n'
-                '      "wrongSnippet": "孩子原卷上的错误写法或卡壳点",\n'
+                '      "wrongSnippet": "孩子原卷上的错误写法或缺失过程",\n'
                 '      "errorCause": "温柔清晰的错因分析",\n'
                 '      "correctSteps": ["第一步：...", "第二步：...", "第三步：得出正确答案..."],\n'
                 '      "practiceQuestion": "一道同知识点举一反三小练习题",\n'
@@ -232,14 +248,45 @@ async def execute_homework_review_job(job_id: str, task_id: str, upload_kind: st
                 "}"
             )
 
-            eval_data, new_session_id = await run_supervised_dsh_task(
-                child,
-                task_kind="homework_review",
-                task_prompt=dsh_prompt,
-                context={"uploadKind": upload_kind},
-            )
-            if new_session_id:
-                child.dsh_tutor_session_id = new_session_id
+            if vlm_pages:
+                eval_data = await call_supervised_vlm_json(
+                    task_kind="homework_review",
+                    prompt_text=vlm_review_prompt,
+                    images=vlm_pages,
+                    audit_fn=audit_dsh_payload_completeness,
+                    audit_context={"uploadKind": upload_kind},
+                )
+            else:
+                eval_data, new_session_id = await run_supervised_dsh_task(
+                    child,
+                    task_kind="homework_review",
+                    task_prompt=vlm_review_prompt,
+                    context={"uploadKind": upload_kind},
+                )
+                if new_session_id:
+                    child.dsh_tutor_session_id = new_session_id
+
+            mem_note = str(eval_data.get("memoryNote") or "").strip()
+            if mem_note:
+                with memory_file.open("a", encoding="utf-8") as mf:
+                    mf.write(f"\n- [{task.task_date} · {task.title}] {mem_note}\n")
+            if eval_data.get("newMistakes"):
+                with mistakes_jsonl_file.open("a", encoding="utf-8") as jf:
+                    for m_raw in eval_data.get("newMistakes") or []:
+                        jf.write(
+                            json.dumps(
+                                {
+                                    "date": task.task_date,
+                                    "task": task.title,
+                                    "subject": task.subject,
+                                    "title": m_raw.get("questionTitle"),
+                                    "wrong": m_raw.get("wrongSnippet"),
+                                    "cause": m_raw.get("errorCause"),
+                                },
+                                ensure_ascii=False,
+                            )
+                            + "\n"
+                        )
 
             await update_job_progress(
                 job_id,
@@ -276,7 +323,6 @@ async def execute_homework_review_job(job_id: str, task_id: str, upload_kind: st
                         m.mastery_status = "mastered"
                         m.mastered_at = utc_now_iso()
 
-            image_bytes_cache: dict[str, bytes] = {}
             img_map = {im.id: im for im in all_images}
 
             for m_item in eval_data.get("newMistakes") or []:

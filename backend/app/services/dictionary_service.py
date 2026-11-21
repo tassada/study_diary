@@ -11,7 +11,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from ..database import AsyncSessionLocal, get_db_session
 from ..models import AsyncJobModel, ChildModel, DictionaryLookupModel, utc_now_iso
-from ..providers.deepseek_tools import recognize_image_via_deepseek_ocr
+from ..providers.deepseek_vlm import call_supervised_vlm_json
 from ..providers.minio_store import minio_gateway
 from ..schemas import (
     AsyncJobOut,
@@ -21,7 +21,7 @@ from ..schemas import (
     DictionarySenseOut,
 )
 from .audit_logger import log_error, log_event
-from .dsh_supervisor import run_supervised_dsh_task
+from .dsh_supervisor import audit_dsh_payload_completeness, job_supervisor
 from .image_pipeline import normalize_homework_image
 from .tts_cache_service import get_or_synthesize_tts_key
 
@@ -47,7 +47,7 @@ def extract_mask_boxes_1000(mask_png_bytes: bytes) -> list[list[int]]:
         if mw <= 0 or mh <= 0:
             return []
 
-        gw = 220
+        gw = 360
         gh = max(1, round(gw * mh / mw))
         small_alpha = rgba.getchannel("A").resize((gw, gh), Image.Resampling.BILINEAR)
         alpha_bytes = small_alpha.tobytes()
@@ -69,11 +69,11 @@ def extract_mask_boxes_1000(mask_png_bytes: bytes) -> list[list[int]]:
         for x in range(gw):
             if not active[y][x]:
                 continue
-            for dy in range(-1, 2):
+            for dy in (-1, 0, 1):
                 ny = y + dy
                 if ny < 0 or ny >= gh:
                     continue
-                for dx in range(-3, 4):
+                for dx in (-1, 0, 1):
                     nx = x + dx
                     if 0 <= nx < gw:
                         dilated[ny][nx] = True
@@ -107,10 +107,10 @@ def extract_mask_boxes_1000(mask_png_bytes: bytes) -> list[list[int]]:
                         if 0 <= nx < gw and 0 <= ny < gh and dilated[ny][nx] and not visited[ny][nx]:
                             visited[ny][nx] = True
                             q.append((nx, ny))
-            if area >= 4:
+            if area >= 6:
                 raw_boxes.append((min_x, min_y, max_x, max_y, area))
 
-    raw_boxes.sort(key=lambda b: (b[1] // 10, b[0]))
+    raw_boxes.sort(key=lambda b: (b[1] // 16, b[0]))
 
     boxes_1000: list[list[int]] = []
     for bx1, by1, bx2, by2, _ in raw_boxes[:8]:
@@ -123,6 +123,30 @@ def extract_mask_boxes_1000(mask_png_bytes: bytes) -> list[list[int]]:
     return boxes_1000
 
 
+def parse_regions_1000(regions_json: str) -> list[list[int]]:
+    try:
+        parsed = json.loads(regions_json or "[]")
+    except Exception:
+        return []
+    if not isinstance(parsed, list):
+        return []
+    out: list[list[int]] = []
+    for item in parsed[:8]:
+        if isinstance(item, dict):
+            raw = [item.get("x1"), item.get("y1"), item.get("x2"), item.get("y2")]
+        elif isinstance(item, list) and len(item) == 4:
+            raw = item
+        else:
+            continue
+        try:
+            x1, y1, x2, y2 = [max(0, min(1000, int(round(float(v))))) for v in raw]
+        except (TypeError, ValueError):
+            continue
+        if x2 > x1 and y2 > y1:
+            out.append([x1, y1, x2, y2])
+    return out
+
+
 def render_highlighted_preview_jpeg(
     base_jpeg_bytes: bytes,
     mask_png_bytes: bytes,
@@ -132,8 +156,8 @@ def render_highlighted_preview_jpeg(
         base_rgba = base_im.convert("RGBA")
         bw, bh = base_rgba.size
         mask_alpha = mask_im.convert("RGBA").getchannel("A").resize((bw, bh), Image.Resampling.BILINEAR)
-        tint = Image.new("RGBA", (bw, bh), (255, 92, 168, 0))
-        scaled_alpha = mask_alpha.point(lambda a: min(125, int(a * 0.48)))
+        tint = Image.new("RGBA", (bw, bh), (255, 220, 40, 0))
+        scaled_alpha = mask_alpha.point(lambda a: min(130, int(a * 0.52)))
         tint.putalpha(scaled_alpha)
         merged = Image.alpha_composite(base_rgba, tint).convert("RGB")
 
@@ -143,10 +167,10 @@ def render_highlighted_preview_jpeg(
             py1 = int(y1 * bh / 1000)
             px2 = int(x2 * bw / 1000)
             py2 = int(y2 * bh / 1000)
-            draw.rectangle([px1, py1, px2, py2], outline=(201, 42, 106), width=3)
+            draw.rectangle([px1, py1, px2, py2], outline=(225, 29, 72), width=4)
             badge_y = max(4, py1 - 24)
-            draw.rectangle([px1, badge_y, px1 + 26, badge_y + 22], fill=(236, 95, 155))
-            draw.text((px1 + 7, badge_y + 4), str(idx + 1), fill=(255, 255, 255))
+            draw.rectangle([px1, badge_y, px1 + 28, badge_y + 22], fill=(225, 29, 72))
+            draw.text((px1 + 6, badge_y + 4), f"#{idx + 1}", fill=(255, 255, 255))
 
         out = BytesIO()
         merged.save(out, format="JPEG", quality=86)
@@ -154,23 +178,23 @@ def render_highlighted_preview_jpeg(
 
 
 def crop_box_with_padding_jpeg(
-    base_jpeg_bytes: bytes,
+    source_jpeg_bytes: bytes,
     box_1000: list[int],
     pad_x_ratio: float,
     pad_y_ratio: float,
-    min_side_px: int = 96,
+    min_side_px: int = 160,
 ) -> bytes:
-    with Image.open(BytesIO(base_jpeg_bytes)) as im:
+    with Image.open(BytesIO(source_jpeg_bytes)) as im:
         rgb = im.convert("RGB")
         w, h = rgb.size
         x1, y1, x2, y2 = box_1000
         bw_1000 = max(12, x2 - x1)
         bh_1000 = max(12, y2 - y1)
 
-        px1 = max(0, int((x1 - bw_1000 * pad_x_ratio) * w / 1000) - 8)
-        py1 = max(0, int((y1 - bh_1000 * pad_y_ratio) * h / 1000) - 8)
-        px2 = min(w, int((x2 + bw_1000 * pad_x_ratio) * w / 1000) + 8)
-        py2 = min(h, int((y2 + bh_1000 * pad_y_ratio) * h / 1000) + 8)
+        px1 = max(0, int((x1 - bw_1000 * pad_x_ratio) * w / 1000) - 6)
+        py1 = max(0, int((y1 - bh_1000 * pad_y_ratio) * h / 1000) - 6)
+        px2 = min(w, int((x2 + bw_1000 * pad_x_ratio) * w / 1000) + 6)
+        py2 = min(h, int((y2 + bh_1000 * pad_y_ratio) * h / 1000) + 6)
 
         crop = rgb.crop((px1, py1, max(px1 + 8, px2), max(py1 + 8, py2)))
         cw, ch = crop.size
@@ -180,10 +204,10 @@ def crop_box_with_padding_jpeg(
                 (max(1, round(cw * scale)), max(1, round(ch * scale))),
                 Image.Resampling.BICUBIC,
             )
-        canvas = Image.new("RGB", (crop.width + 48, crop.height + 48), (255, 255, 255))
-        canvas.paste(crop, (24, 24))
+        canvas = Image.new("RGB", (crop.width + 32, crop.height + 32), (255, 255, 255))
+        canvas.paste(crop, (16, 16))
         buf = BytesIO()
-        canvas.save(buf, format="JPEG", quality=92)
+        canvas.save(buf, format="JPEG", quality=90)
         return buf.getvalue()
 
 
@@ -229,6 +253,7 @@ def serialize_lookup_row(row: DictionaryLookupModel) -> DictionaryLookupOut:
 
 
 async def update_dict_job(job_id: str, status: str, progress_text: str) -> None:
+    job_supervisor.heartbeat(job_id)
     async with AsyncSessionLocal() as db:
         job = await db.get(AsyncJobModel, job_id)
         if job:
@@ -247,134 +272,124 @@ async def execute_dictionary_lookup_job(
     instruction: str,
 ) -> None:
     started = time.perf_counter()
+    job_supervisor.mark_started(job_id)
     try:
         raw_jpeg, _ = await minio_gateway.get_object_bytes(raw_image_key)
-        await update_dict_job(
-            job_id,
-            "ocr_running",
-            f"正在识别涂抹的 {len(boxes_1000)} 处文字与上下文...",
-        )
-
-        sem = asyncio.Semaphore(3)
-        region_crops_meta: list[dict] = []
-
-        async def _ocr_one_region(idx: int, box: list[int]) -> dict:
-            tight_jpeg = crop_box_with_padding_jpeg(raw_jpeg, box, pad_x_ratio=0.14, pad_y_ratio=0.18)
-            ctx_jpeg = crop_box_with_padding_jpeg(raw_jpeg, box, pad_x_ratio=1.6, pad_y_ratio=1.1)
-            crop_key = f"dictionary-crops/{child_id}/{lookup_id}/region-{idx + 1}.jpg"
-            await minio_gateway.put_bytes(crop_key, tight_jpeg, "image/jpeg")
-
-            async with sem:
-                tight_ocr, ctx_ocr = await asyncio.gather(
-                    recognize_image_via_deepseek_ocr(tight_jpeg, f"dict_tight_{idx + 1}.jpg"),
-                    recognize_image_via_deepseek_ocr(ctx_jpeg, f"dict_ctx_{idx + 1}.jpg"),
-                )
-            return {
-                "regionIndex": idx + 1,
-                "box1000": box,
-                "cropMinioKey": crop_key,
-                "tightOcrText": tight_ocr["plain_text"].strip(),
-                "contextOcrText": ctx_ocr["plain_text"].strip(),
-            }
-
-        region_crops_meta = list(
-            await asyncio.gather(
-                *[_ocr_one_region(idx, box) for idx, box in enumerate(boxes_1000)]
-            )
-        )
+        annotated_jpeg, _ = await minio_gateway.get_object_bytes(preview_image_key)
 
         await update_dict_job(
             job_id,
             "dsh_running",
-            "海星老师正在整理中英双解字典卡（笔画、拼音、音标、同反义词）...",
+            f"DeepSeek-V4.1-Flash 正在直接审阅图中标记的 {max(1, len(boxes_1000))} 处字词...",
         )
+
+        vlm_images: list[tuple[str, bytes]] = [
+            ("已直接绘制红框/荧光涂色标记的全图", annotated_jpeg),
+        ]
+        crop_by_region: dict[int, str] = {}
+
+        for idx, box in enumerate(boxes_1000[:6]):
+            r_no = idx + 1
+            clean_crop = crop_box_with_padding_jpeg(
+                raw_jpeg,
+                box,
+                pad_x_ratio=0.10,
+                pad_y_ratio=0.12,
+            )
+            marked_zoom = crop_box_with_padding_jpeg(
+                annotated_jpeg,
+                box,
+                pad_x_ratio=0.45,
+                pad_y_ratio=0.55,
+            )
+            crop_key = f"dictionary-crops/{child_id}/{lookup_id}/region-{r_no}.jpg"
+            await minio_gateway.put_bytes(crop_key, clean_crop, "image/jpeg")
+            crop_by_region[r_no] = crop_key
+            vlm_images.append(
+                (f"标记区域 #{r_no} 的带标记局部放大图（请只提取红框内部或荧光笔直接涂抹到的文字，严禁把框外/未涂色的邻词算进来）", marked_zoom)
+            )
 
         async with AsyncSessionLocal() as db:
             child = await db.get(ChildModel, child_id)
             if not child:
                 raise RuntimeError("儿童档案不存在")
 
-        prompt_regions = [
-            {
-                "regionIndex": r["regionIndex"],
-                "paintedTightOcr": r["tightOcrText"],
-                "surroundingContextOcr": r["contextOcrText"],
-            }
-            for r in region_crops_meta
-        ]
-        user_instr = instruction.strip() or "请对涂抹出来的字词做标准中英双解查字典解析"
+        expected_regions = max(1, len(boxes_1000))
+        user_instr = instruction.strip() or "请对图中红框圈出或荧光色涂抹的字词做精准中英双解查字典解析"
 
-        dsh_prompt = (
-            "任务类型：小学生拍照涂抹查字典 / 中英双解词典（请直接输出纯 JSON，不要读写额外文件以最快速度响应）。\n"
+        vlm_prompt = (
+            "你是专业的小学生多模态中英双解词典导师。请直接看上面传入的标记图片！\n"
             f"学生：{child.display_name}（{child.age}岁，{child.grade_label}）。\n"
-            f"用户附加查词指令：「{user_instr}」\n"
-            f"涂抹区域识别列表（共 {len(prompt_regions)} 处，`paintedTightOcr` 是手指画笔正下方识别出的字符，`surroundingContextOcr` 是该涂抹处周边的整词/整句上下文）：\n"
-            f"{json.dumps(prompt_regions, ensure_ascii=False, indent=2)}\n\n"
-            "请严格遵守以下字典编纂规则：\n"
-            "1. 每一处涂抹区域对应返回 entries 数组中的 1 个字典条目（若某处长条涂抹明显同时涂了多个独立待查生词，也可拆分为多条并保留对应 regionIndex）。\n"
-            "2. 【猜是否画错 / 涂偏补全】：对比 `paintedTightOcr` 与 `surroundingContextOcr`。如果孩子少涂了半个单词（例如只涂到 'diction'，上下文是 'dictionary'）、少涂了双音节词/成语的一半、或多涂进了旁边标点/相邻无关半字，请智能猜出真正想查的完整字词作为 `headword`，将 `guessedCorrection` 设为 true，并在 `guessExplanation` 用温和简短的话说明（如：\"涂抹处为「diction」，结合句子猜你想查完整单词「dictionary」\"）。若涂抹准确则 `guessedCorrection` 为 false。\n"
-            "3. 【实在猜不出时坦诚告知】：如果 `paintedTightOcr` 为空或乱码，且结合上下文也无法判断孩子到底涂了哪个字词（例如涂在空白处、纯插图或字迹完全模糊），绝不能瞎编字词！此时必须将该条目的 `unrecognized` 设为 true，`unrecognizedReason` 写明友好提示（如：\"这处涂抹没有识别到清晰的字词，实在猜不出哦，请擦掉重涂准一点或重拍一张更清晰的照片试试\"），其余词典字段留空即可。\n"
-            "4. 【中英两种一起返回 + 完整字典要素】：对于所有成功识别或猜出的条目（无论原词是中文还是英文），都必须同时给出中文与英文对照：\n"
-            "   - `sourceLanguage`: 原词是中文填 \"zh\"，原词是英文填 \"en\"。\n"
-            "   - `headword`: 被查原词本身（纯字词，不含音标拼音）。\n"
-            "   - `chineseWord`: 中文词头（查中文时即被查词本身；查英文时填最核心对应的一个中文词，纯中文供独立点读，不要带括号解释）。\n"
-            "   - `pinyin`: `chineseWord` 的标准带声调拼音（如 \"zhān yǎng\"）。\n"
-            "   - `englishWord`: 英文词头（查英文时即被查词本身；查中文时填最地道对应的一个英文单词或短语，纯英文供独立点读，不要带斜杠或中文）。\n"
-            "   - `ipa`: `englishWord` 的标准国际音标（如 \"/mæɡˈnɪfɪsnt/\"）。\n"
-            "   - `charStrokes`: 汉字笔画数组。当查中文（或对应中文含重点生字）时，列出每个核心汉字的 `char`（单字）、`radical`（部首）、`totalStrokes`（总笔画数整数）、`strokeOrder`（按顺序列出标准笔顺，如 \"竖、横折、横、横、横...\"）。查中文时此数组不能为空！\n"
-            "   - `senses`: 按字典义项 `1, 2, 3, 4` 编号的分条字义/词义数组（多义字词给 2~4 个常见义项，单义词给 1~2 个真实义项，不胡编），每项包含 `index`（1,2,3...）、`pos`（词性，如 \"v. 动词\" / \"n. 名词\" / \"adj. 形容词\"）、`zhMeaning`（清晰易懂的中文释义）、`enMeaning`（简明英文释义）、`example`（简短例句）。\n"
-            "   - `synonyms`: 同义词/近义词字符串数组（2~4个）。\n"
-            "   - `antonyms`: 反义词字符串数组（1~3个；若专有名词或具体物品确无反义词可填 []）。\n\n"
-            "严格返回如下纯 JSON 对象：\n"
+            f"用户查词/翻译指令：「{user_instr}」\n"
+            f"用户在图片像素上直接标记了 {expected_regions} 处目标（可能使用了【红色矩形框 #1/#2...】和/或【荧光色画笔涂抹】）。\n\n"
+            "请严格遵守以下视觉识别与字典编纂铁律：\n"
+            "1. 【像素级边界精准铁律（最重要）】：\n"
+            "   - 只提取**物理上位于红色矩形框内部**或**被荧光颜色直接涂盖**的字词！\n"
+            "   - 红框外面、荧光笔没有涂到的上下行文字或左右相邻单词（哪怕离得很近），绝对只是背景上下文，**严禁当作被查词返回**！\n"
+            "   - 每一处独立标记区域对应返回 entries 中的 1 个条目（除非同一个大框/长涂抹里明确圈了多个并列独立单词且用户要求查多词，或圈了一整句话）。\n"
+            "2. 【猜是否框偏/涂漏一半】：\n"
+            "   - 只有当红框边线或荧光笔明显把**同一个单词或同一个成语/词语从中间切了一半**（例如单词 `listen` 只框到了 `lis`，或词语 `瞻仰` 只涂了 `瞻` 且上下文是连在一起的 `瞻仰`）时，才补全为完整词，将 `guessedCorrection` 设为 true 并在 `guessExplanation` 简短说明。\n"
+            "   - 如果框内/涂抹处本身已经是一个完整独立的词（例如词表里的 `decide`，或标题 `新店预告`），`guessedCorrection` 必须为 false，直接查这个词本身，绝不要去猜它旁边或下一行没被框住的其他词！\n"
+            "3. 【支持整句/短语翻译】：\n"
+            "   - 如果某处红框或涂抹明显圈住了一整句话/长短语（或用户指令要求翻译句子），请把该完整句子作为条目返回：`headword` 填原句，`chineseWord` 填地道中文译文（或原中文句），`englishWord` 填对应英文译文（或原英文句），在 `senses[0]`（`pos`: \"整句精译\"）给出完整双语解释与句意点拨；若句中有 1 个核心难词也可额外附带一条该生词的字典卡。\n"
+            "4. 【空白/纯图案实在猜不出时坦诚告知】：\n"
+            "   - 如果某处红框或涂抹画在纯空白背景、插图或完全无法辨认的涂鸦上，绝不能瞎编字词！将该条目的 `unrecognized` 设为 true，`unrecognizedReason` 写明友好提示。\n"
+            "5. 【完整中英双解字典要素】：\n"
+            "   - `sourceLanguage`: 原文中文填 \"zh\"，英文填 \"en\"。\n"
+            "   - `headword`: 被框/被涂的目标原词（纯字词，不带音标括号）。\n"
+            "   - `chineseWord`: 中文词头（纯中文词，供点击发音只读词本身）。\n"
+            "   - `pinyin`: 标准带声调拼音（如 \"yù gào\"）。\n"
+            "   - `englishWord`: 英文词头（纯英文词或短语，供点击发音只读词本身）。\n"
+            "   - `ipa`: 国际音标（如 \"/dɪˈsaɪd/\"）。\n"
+            "   - `charStrokes`: 核心汉字笔画数组（单字 `char`、部首 `radical`、总笔画数 `totalStrokes`、标准笔顺 `strokeOrder`；查中文词条时必填）。\n"
+            "   - `senses`: 按 `1, 2, 3, 4` 编号的常见字义/词义数组（每项含 `index`, `pos`, `zhMeaning`, `enMeaning`, `example`）。\n"
+            "   - `synonyms`: 2~4 个同义词/近义词。\n"
+            "   - `antonyms`: 1~3 个反义词（无反义词填 []）。\n\n"
+            "严格只输出如下纯 JSON 对象：\n"
             "{\n"
             '  "entries": [\n'
             "    {\n"
             '      "regionIndex": 1,\n'
             '      "unrecognized": false,\n'
             '      "unrecognizedReason": null,\n'
-            '      "paintedRawText": "涂抹处原始字符",\n'
+            '      "paintedRawText": "框内/涂色处看到的原始文字",\n'
             '      "guessedCorrection": false,\n'
             '      "guessExplanation": null,\n'
-            '      "sourceLanguage": "zh",\n'
-            '      "headword": "瞻仰",\n'
-            '      "chineseWord": "瞻仰",\n'
-            '      "pinyin": "zhān yǎng",\n'
-            '      "englishWord": "revere",\n'
-            '      "ipa": "/rɪˈvɪə(r)/",\n'
+            '      "sourceLanguage": "en",\n'
+            '      "headword": "decide",\n'
+            '      "chineseWord": "决定",\n'
+            '      "pinyin": "jué dìng",\n'
+            '      "englishWord": "decide",\n'
+            '      "ipa": "/dɪˈsaɪd/",\n'
             '      "charStrokes": [\n'
-            '        {"char": "瞻", "radical": "目", "totalStrokes": 17, "strokeOrder": "竖、横折、横、横、横、撇、横撇、撇、点、点、横、撇、竖、横、横、横、竖弯钩"}\n'
+            '        {"char": "决", "radical": "冫", "totalStrokes": 6, "strokeOrder": "点、提、横折、横、撇、捺"}\n'
             "      ],\n"
             '      "senses": [\n'
-            '        {"index": 1, "pos": "v. 动词", "zhMeaning": "怀着崇敬的心情观看", "enMeaning": "look at with reverence and respect", "example": "少先队员们怀着崇敬的心情瞻仰人民英雄纪念碑。"}\n'
+            '        {"index": 1, "pos": "v. 动词", "zhMeaning": "决定；下决心", "enMeaning": "to make a choice after thinking carefully", "example": "We decided to walk home. 我们决定走路回家。"}\n'
             "      ],\n"
-            '      "synonyms": ["敬仰", "仰望"],\n'
-            '      "antonyms": ["轻视", "鄙视"]\n'
+            '      "synonyms": ["choose", "determine"],\n'
+            '      "antonyms": ["hesitate"]\n'
             "    }\n"
             "  ]\n"
             "}"
         )
 
-        dsh_json, _ = await run_supervised_dsh_task(
-            child,
+        vlm_json = await call_supervised_vlm_json(
             task_kind="dictionary_lookup",
-            task_prompt=dsh_prompt,
-            context={"expectedCount": len(region_crops_meta)},
+            prompt_text=vlm_prompt,
+            images=vlm_images,
+            audit_fn=audit_dsh_payload_completeness,
+            audit_context={"expectedCount": expected_regions},
         )
-        raw_entries = dsh_json.get("entries") or []
+        raw_entries = vlm_json.get("entries") or []
 
-        crop_by_region = {r["regionIndex"]: r["cropMinioKey"] for r in region_crops_meta}
-        tight_by_region = {r["regionIndex"]: r["tightOcrText"] for r in region_crops_meta}
         stored_entries: list[dict] = []
-
         for idx, raw_e in enumerate(raw_entries):
-            r_idx = int(raw_e.get("regionIndex") or (idx + 1))
+            r_idx = int(raw_e.get("regionIndex") or min(max(1, expected_regions), idx + 1))
             unrec = bool(raw_e.get("unrecognized", False))
             zh_word = str(raw_e.get("chineseWord") or "").strip()
             en_word = str(raw_e.get("englishWord") or "").strip()
             headword = str(raw_e.get("headword") or zh_word or en_word).strip()
-
-            zh_tts_key: str | None = None
-            en_tts_key: str | None = None
 
             strokes_norm = []
             for st in raw_e.get("charStrokes") or []:
@@ -405,23 +420,21 @@ async def execute_dictionary_lookup_job(
                 {
                     "entryId": f"dentry-{uuid.uuid4().hex[:10]}",
                     "regionIndex": r_idx,
-                    "cropMinioKey": crop_by_region.get(r_idx),
+                    "cropMinioKey": crop_by_region.get(r_idx) or crop_by_region.get(1),
                     "unrecognized": unrec,
                     "unrecognizedReason": raw_e.get("unrecognizedReason")
-                    or ("这处涂抹没有识别出清晰字词，实在猜不出哦，请擦掉重涂或重拍试试" if unrec else None),
-                    "paintedRawText": str(
-                        raw_e.get("paintedRawText") or tight_by_region.get(r_idx) or ""
-                    ),
+                    or ("这处标记没有识别出清晰字词，实在猜不出哦，请重框或重涂试试" if unrec else None),
+                    "paintedRawText": str(raw_e.get("paintedRawText") or headword),
                     "guessedCorrection": bool(raw_e.get("guessedCorrection", False)),
                     "guessExplanation": raw_e.get("guessExplanation"),
                     "sourceLanguage": "en" if raw_e.get("sourceLanguage") == "en" else "zh",
                     "headword": headword,
                     "chineseWord": zh_word,
                     "pinyin": str(raw_e.get("pinyin") or ""),
-                    "chineseTtsKey": zh_tts_key,
+                    "chineseTtsKey": None,
                     "englishWord": en_word,
                     "ipa": str(raw_e.get("ipa") or ""),
-                    "englishTtsKey": en_tts_key,
+                    "englishTtsKey": None,
                     "charStrokes": strokes_norm,
                     "senses": senses_norm,
                     "synonyms": [str(x) for x in (raw_e.get("synonyms") or [])],
@@ -444,14 +457,14 @@ async def execute_dictionary_lookup_job(
             job = await db.get(AsyncJobModel, job_id)
             if job:
                 job.status = "succeeded"
-                job.progress_text = "查词完成！"
+                job.progress_text = "多模态查词完成！"
                 job.result_json = json.dumps({"lookupId": lookup_id}, ensure_ascii=False)
                 job.finished_at = utc_now_iso()
             await db.commit()
 
         log_event(
             "dictionary.lookup_succeeded",
-            f"涂抹查字典完成 (共 {len(stored_entries)} 项)",
+            f"DeepSeek-V4.1-Flash 查字典完成 (共 {len(stored_entries)} 项)",
             jobId=job_id,
             lookupId=lookup_id,
             childId=child_id,
@@ -463,7 +476,7 @@ async def execute_dictionary_lookup_job(
     except Exception as exc:
         log_error(
             "dictionary.lookup_failed",
-            f"涂抹查字典失败 (lookup={lookup_id})",
+            f"多模态查字典失败 (lookup={lookup_id})",
             exc=exc,
             jobId=job_id,
             lookupId=lookup_id,
@@ -478,6 +491,8 @@ async def execute_dictionary_lookup_job(
                 job.error_detail = str(exc)
                 job.finished_at = utc_now_iso()
                 await db.commit()
+    finally:
+        job_supervisor.mark_finished(job_id)
 
 
 @dictionary_router.post(
@@ -487,25 +502,42 @@ async def execute_dictionary_lookup_job(
 async def submit_dictionary_lookup(
     child_id: str,
     instruction: str = Form(""),
-    image_file: UploadFile = File(...),
-    mask_file: UploadFile = File(...),
+    regions_json: str = Form("[]"),
+    annotated_file: UploadFile | None = File(default=None),
+    image_file: UploadFile | None = File(default=None),
+    mask_file: UploadFile | None = File(default=None),
     db: AsyncSession = Depends(get_db_session),
 ) -> AsyncJobOut:
     child = await db.get(ChildModel, child_id)
     if not child:
         raise HTTPException(status_code=404, detail="儿童档案不存在")
 
-    raw_img_bytes = await image_file.read()
-    mask_png_bytes = await mask_file.read()
-    if not raw_img_bytes or not mask_png_bytes:
-        raise HTTPException(status_code=400, detail="请先上传照片并用画笔涂抹要查的字词")
+    annotated_bytes = await annotated_file.read() if annotated_file is not None else b""
+    raw_img_bytes = await image_file.read() if image_file is not None else b""
+    mask_png_bytes = await mask_file.read() if mask_file is not None else b""
 
-    boxes_1000 = extract_mask_boxes_1000(mask_png_bytes)
-    if not boxes_1000:
-        raise HTTPException(status_code=400, detail="还没有涂抹任何字词哦，请先选画笔涂在想查的字词上")
+    if not annotated_bytes and not raw_img_bytes:
+        raise HTTPException(status_code=400, detail="请先上传照片并画框或涂色标记要查的字词")
 
-    norm_jpeg, _, _ = normalize_homework_image(raw_img_bytes, max_edge=1600)
-    preview_jpeg = render_highlighted_preview_jpeg(norm_jpeg, mask_png_bytes, boxes_1000)
+    boxes_1000 = parse_regions_1000(regions_json)
+    if not boxes_1000 and mask_png_bytes:
+        boxes_1000 = extract_mask_boxes_1000(mask_png_bytes)
+
+    if annotated_bytes:
+        preview_jpeg, _, _ = normalize_homework_image(annotated_bytes, max_edge=1600)
+        if raw_img_bytes:
+            norm_jpeg, _, _ = normalize_homework_image(raw_img_bytes, max_edge=1600)
+        else:
+            norm_jpeg = preview_jpeg
+    else:
+        if not boxes_1000:
+            raise HTTPException(status_code=400, detail="还没有画框或涂抹任何字词哦")
+        norm_jpeg, _, _ = normalize_homework_image(raw_img_bytes, max_edge=1600)
+        preview_jpeg = (
+            render_highlighted_preview_jpeg(norm_jpeg, mask_png_bytes, boxes_1000)
+            if mask_png_bytes
+            else norm_jpeg
+        )
 
     lookup_id = f"dict-{uuid.uuid4().hex[:12]}"
     raw_key = f"dictionary-raw/{child_id}/{lookup_id}.jpg"
@@ -515,6 +547,7 @@ async def submit_dictionary_lookup(
         minio_gateway.put_bytes(preview_key, preview_jpeg, "image/jpeg"),
     )
 
+    region_count = max(1, len(boxes_1000))
     job_id = f"job-dict-{uuid.uuid4().hex[:10]}"
     job = AsyncJobModel(
         id=job_id,
@@ -522,7 +555,7 @@ async def submit_dictionary_lookup(
         task_id=lookup_id,
         job_type="dictionary_lookup",
         status="queued",
-        progress_text=f"已框定 {len(boxes_1000)} 处涂抹区域，正在启动查词...",
+        progress_text=f"已生成 {region_count} 处标记像素图，正在交由 DeepSeek-V4.1-Flash 解析...",
         created_at=utc_now_iso(),
     )
     db.add(job)
@@ -531,11 +564,12 @@ async def submit_dictionary_lookup(
 
     log_event(
         "dictionary.lookup_queued",
-        f"提交涂抹查字典 ({len(boxes_1000)} 处区域)",
+        f"提交多模态涂色/画框查字典 ({region_count} 处区域)",
         jobId=job_id,
         lookupId=lookup_id,
         childId=child_id,
-        regionCount=len(boxes_1000),
+        regionCount=region_count,
+        pixelBaked=bool(annotated_bytes),
         instruction=instruction[:100],
     )
 
