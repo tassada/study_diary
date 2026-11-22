@@ -10,12 +10,21 @@ from .dsh_agent import extract_json_object
 VLM_MODEL_ID = "deepseek-flash"
 
 
+def parse_vlm_json_object(raw_text: str) -> dict[str, Any]:
+    try:
+        return extract_json_object(raw_text)
+    except ValueError as exc:
+        cleaned = (raw_text or "").strip()
+        raise ValueError(f"DeepSeek-V4.1-Flash 未返回合法 JSON 结构: {cleaned[:300]}") from exc
+
+
 async def call_deepseek_vlm_json(
     prompt_text: str,
     images: list[tuple[str, bytes]],
     system_prompt: str = "",
-    max_tokens: int = 8192,
-    timeout_sec: float = 150.0,
+    max_tokens: int = 32768,
+    timeout_sec: float = 240.0,
+    reasoning_effort: str | None = None,
 ) -> dict[str, Any]:
     started = time.perf_counter()
     url = f"{settings.deepseek_tools_origin.rstrip('/')}/v1/chat/completions"
@@ -42,15 +51,20 @@ async def call_deepseek_vlm_json(
         messages.append({"role": "system", "content": system_prompt.strip()})
     messages.append({"role": "user", "content": user_content})
 
-    payload = {
-        "model": VLM_MODEL_ID,
-        "messages": messages,
-        "max_tokens": max_tokens,
-        "response_format": {"type": "json_object"},
-    }
-
     last_exc: Exception | None = None
     for attempt in range(1, 3):
+        attempt_max_tokens = (
+            max_tokens if attempt == 1 else min(131072, max(max_tokens * 2, 32768))
+        )
+        payload: dict[str, Any] = {
+            "model": VLM_MODEL_ID,
+            "messages": messages,
+            "max_tokens": attempt_max_tokens,
+            "response_format": {"type": "json_object"},
+        }
+        if reasoning_effort:
+            payload["reasoning_effort"] = reasoning_effort
+
         try:
             transport = httpx.AsyncHTTPTransport(retries=2)
             async with httpx.AsyncClient(transport=transport, timeout=timeout_sec) as client:
@@ -73,18 +87,46 @@ async def call_deepseek_vlm_json(
             if not choices:
                 raise RuntimeError(f"DeepSeek-V4.1-Flash 返回空 choices: {str(data)[:300]}")
 
-            msg = choices[0].get("message") or {}
+            choice0 = choices[0]
+            finish_reason = str(choice0.get("finish_reason") or "")
+            msg = choice0.get("message") or {}
             raw_content = str(msg.get("content") or "").strip()
-            parsed = extract_json_object(raw_content)
             usage = data.get("usage") or {}
+            reasoning_tokens = (usage.get("completion_tokens_details") or {}).get(
+                "reasoning_tokens"
+            )
+
+            if not raw_content or finish_reason == "length":
+                if raw_content:
+                    try:
+                        parsed = parse_vlm_json_object(raw_content)
+                    except Exception as parse_err:
+                        raise RuntimeError(
+                            f"DeepSeek-V4.1-Flash 输出达到上限被截断 "
+                            f"(finish_reason={finish_reason}, max_tokens={attempt_max_tokens}, "
+                            f"completion_tokens={usage.get('completion_tokens')}, "
+                            f"reasoning_tokens={reasoning_tokens})"
+                        ) from parse_err
+                else:
+                    raise RuntimeError(
+                        f"DeepSeek-V4.1-Flash 正文为空 "
+                        f"(finish_reason={finish_reason}, max_tokens={attempt_max_tokens}, "
+                        f"completion_tokens={usage.get('completion_tokens')}, "
+                        f"reasoning_tokens={reasoning_tokens})"
+                    )
+            else:
+                parsed = parse_vlm_json_object(raw_content)
 
             log_event(
                 "ai.deepseek_vlm",
                 f"DeepSeek-V4.1-Flash 多模态视觉推理完成 ({len(images)} 张图)",
                 model=data.get("model") or VLM_MODEL_ID,
                 imageCount=len(images),
+                finishReason=finish_reason,
+                reasoningEffort=reasoning_effort or "default",
                 promptTokens=usage.get("prompt_tokens"),
                 completionTokens=usage.get("completion_tokens"),
+                reasoningTokens=reasoning_tokens,
                 elapsedMs=round((time.perf_counter() - started) * 1000, 1),
             )
             return parsed
@@ -93,8 +135,9 @@ async def call_deepseek_vlm_json(
             if attempt == 1:
                 log_warn(
                     "ai.deepseek_vlm_retry",
-                    f"DeepSeek-V4.1-Flash 首次请求异常，正在进行第 2 次幂等重试: {exc}",
+                    f"DeepSeek-V4.1-Flash 首次请求异常，正在升级容量进行第 2 次幂等重试: {exc}",
                     imageCount=len(images),
+                    nextMaxTokens=min(131072, max(max_tokens * 2, 32768)),
                 )
                 continue
 
@@ -116,6 +159,9 @@ async def call_supervised_vlm_json(
     audit_fn: Any,
     audit_context: dict[str, Any] | None = None,
     system_prompt: str = "",
+    max_tokens: int = 32768,
+    timeout_sec: float = 240.0,
+    reasoning_effort: str | None = None,
 ) -> dict[str, Any]:
     candidate: dict[str, Any] | None = None
     first_err: Exception | None = None
@@ -125,6 +171,9 @@ async def call_supervised_vlm_json(
             prompt_text=prompt_text,
             images=images,
             system_prompt=system_prompt,
+            max_tokens=max_tokens,
+            timeout_sec=timeout_sec,
+            reasoning_effort=reasoning_effort,
         )
     except Exception as exc:
         first_err = exc
@@ -156,6 +205,9 @@ async def call_supervised_vlm_json(
         prompt_text=repair_prompt,
         images=images,
         system_prompt=system_prompt,
+        max_tokens=min(131072, max(max_tokens * 2, 49152)),
+        timeout_sec=max(timeout_sec, 270.0),
+        reasoning_effort=reasoning_effort,
     )
     log_event(
         "ai.deepseek_vlm_supervised_repaired",

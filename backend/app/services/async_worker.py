@@ -117,48 +117,67 @@ async def execute_homework_review_job(job_id: str, task_id: str, upload_kind: st
 
             image_bytes_cache: dict[str, bytes] = {}
 
-            for idx, img_row in enumerate(pending_images):
+            if total_pending > 0:
                 await update_job_progress(
                     job_id,
                     "ocr_running",
-                    f"DeepSeek-V4.1-Flash 正在直接看图校准方向并审阅作业页 ({idx + 1}/{total_pending})...",
+                    f"DeepSeek-V4.1-Flash 正在并发校准 {total_pending} 张作业图的朝向与版面...",
                 )
-                img_bytes, _ = await minio_gateway.get_object_bytes(img_row.minio_key)
+                orient_sem = asyncio.Semaphore(4)
                 orient_prompt = (
-                    "请直接观察这张学生作业照片，完成两件事并输出纯 JSON：\n"
-                    "1. `rotateCw`：判断要让纸面上的印刷文字和手写字恢复【正立正向可读】，需要将当前图片顺时针旋转多少度？只能填 0、90、180 或 270。\n"
-                    "2. `pageTranscript`：完整逐题整理本页内容（包含印刷题干、图形/表格/扑克牌等视觉元素说明，以及学生手写作答的原文与涂改情况）。\n"
-                    '严格输出格式：{"rotateCw": 0, "pageTranscript": "【第1题】..."}'
+                    "请直接观察这张学生作业或试卷照片，仅完成朝向判断与版面简述并输出纯 JSON：\n"
+                    "1. `rotateCw`：要让纸面上的印刷文字和手写字恢复【正立正向可读】，需要将当前图片顺时针旋转多少度？只能填 0、90、180 或 270（本来正立填 0）。\n"
+                    "2. `pageBrief`：用 1~2 句话简要概括本页所属练习/试卷名称及包含的大题题号范围（无需逐题抄写全文，不超过 120 字）。\n"
+                    '严格输出格式：{"rotateCw": 0, "pageBrief": "第四单元过关卷第1页，含一、填空题与二、判断题"}'
                 )
-                page_vlm = await call_deepseek_vlm_json(
-                    prompt_text=orient_prompt,
-                    images=[(f"作业照片 {img_row.id}", img_bytes)],
-                    max_tokens=4096,
-                )
-                rot_cw = int(page_vlm.get("rotateCw") or 0) % 360
-                if rot_cw in {90, 180, 270}:
-                    upright_bytes, up_w, up_h = rotate_jpeg_clockwise(img_bytes, rot_cw)
-                    await minio_gateway.put_bytes(img_row.minio_key, upright_bytes, "image/jpeg")
-                    img_row.width = up_w
-                    img_row.height = up_h
-                    img_row.file_size = len(upright_bytes)
-                    image_bytes_cache[img_row.id] = upright_bytes
-                    log_event(
-                        "homework.image_auto_uprighted",
-                        f"DeepSeek-V4.1-Flash 自动顺时针旋转 {rot_cw}° 放正作业图: {img_row.id}",
-                        taskId=task.id,
-                        imageId=img_row.id,
-                        degreesCw=rot_cw,
-                    )
-                else:
-                    image_bytes_cache[img_row.id] = img_bytes
 
-                transcript_str = str(page_vlm.get("pageTranscript") or "").strip()
-                img_row.ocr_status = "done"
-                img_row.ocr_raw_text = transcript_str
-                img_row.ocr_plain_text = transcript_str
-                img_row.ocr_boxes_json = "[]"
-                img_row.ocr_processed_at = utc_now_iso()
+                async def calibrate_single_image(
+                    img_row: TaskImageModel,
+                ) -> tuple[TaskImageModel, bytes, int | None, int | None, str, int]:
+                    async with orient_sem:
+                        raw_bytes, _ = await minio_gateway.get_object_bytes(img_row.minio_key)
+                        page_vlm = await call_deepseek_vlm_json(
+                            prompt_text=orient_prompt,
+                            images=[(f"作业照片 {img_row.id}", raw_bytes)],
+                            max_tokens=8192,
+                            timeout_sec=120.0,
+                            reasoning_effort="low",
+                        )
+                        job_supervisor.heartbeat(job_id)
+                        rot_cw = int(page_vlm.get("rotateCw") or 0) % 360
+                        brief = str(
+                            page_vlm.get("pageBrief") or page_vlm.get("pageTranscript") or ""
+                        ).strip()
+                        if rot_cw in {90, 180, 270}:
+                            upright_bytes, up_w, up_h = rotate_jpeg_clockwise(raw_bytes, rot_cw)
+                            await minio_gateway.put_bytes(
+                                img_row.minio_key, upright_bytes, "image/jpeg"
+                            )
+                            return (img_row, upright_bytes, up_w, up_h, brief, rot_cw)
+                        return (img_row, raw_bytes, None, None, brief, 0)
+
+                calibrated_results = await asyncio.gather(
+                    *(calibrate_single_image(r) for r in pending_images)
+                )
+                now_done_iso = utc_now_iso()
+                for img_row, final_bytes, up_w, up_h, brief, rot_cw in calibrated_results:
+                    image_bytes_cache[img_row.id] = final_bytes
+                    if up_w is not None and up_h is not None:
+                        img_row.width = up_w
+                        img_row.height = up_h
+                        img_row.file_size = len(final_bytes)
+                        log_event(
+                            "homework.image_auto_uprighted",
+                            f"DeepSeek-V4.1-Flash 自动顺时针旋转 {rot_cw}° 放正作业图: {img_row.id}",
+                            taskId=task.id,
+                            imageId=img_row.id,
+                            degreesCw=rot_cw,
+                        )
+                    img_row.ocr_status = "done"
+                    img_row.ocr_raw_text = brief
+                    img_row.ocr_plain_text = brief
+                    img_row.ocr_boxes_json = "[]"
+                    img_row.ocr_processed_at = now_done_iso
                 await db.commit()
 
             await update_job_progress(
@@ -223,7 +242,7 @@ async def execute_homework_review_job(job_id: str, task_id: str, upload_kind: st
                 f"本任务待订正旧错题：{json.dumps(open_mistakes_payload, ensure_ascii=False)}\n\n"
                 "注意批阅与错题定位规则：\n"
                 "1. 本任务采用独立 100 分制（专注30 + 完整度30 + 准确率40）。若 uploadKind 为 correction（错题订正重传）且新上传照片上明确改对了旧错题，允许在原分基础上追回最高 80% 的扣分（不超过98分），并把对应 mistakeId 列入 masteredMistakeIds。\n"
-                "2. 请直接看原图上的印刷题目、图表/图形/扑克牌/表格以及孩子手写答案，逐题核算真伪！发现错题、漏写过程或易错点时，在 newMistakes 中给出原图对应的 `imageId` 与该道题在正立原图上的 0-1000 归一化框坐标 `box: [x1, y1, x2, y2]`（把整道小题题干与学生手写答案完整框住），并配分步解析与一道同类巩固练习题。\n"
+                "2. 请直接看原图上的印刷题目、图表/图形/扑克牌/表格以及孩子手写答案，逐题核算真伪！发现错题、漏写过程或易错点时，在 newMistakes 中给出原图对应的 `imageId` 与该道题在正立原图上的 0-1000 归一化框坐标 `box: [x1, y1, x2, y2]`（把整道小题题干与学生手写答案完整框住），并配分步解析与一道同类巩固练习题（多页试卷若错题超过8处，精选最关键的最多8道代表性错题）。\n"
                 "3. `quickPraise` 必须是首尾完整、独立可读的总结评语（先肯定做对亮点，再点明具体改进结论与鼓励收尾），严禁出现“我们一道一道来！”“下面一起来看看”等半截悬空结尾。\n"
                 "4. `memoryNote` 写一句简练的本次学情观察（用于追加记录到孩子的长期记忆档案）。\n"
                 "最后请严格只输出一个纯 JSON 对象：\n"
@@ -255,6 +274,8 @@ async def execute_homework_review_job(job_id: str, task_id: str, upload_kind: st
                     images=vlm_pages,
                     audit_fn=audit_dsh_payload_completeness,
                     audit_context={"uploadKind": upload_kind},
+                    max_tokens=min(98304, max(32768, 16384 * len(vlm_pages))),
+                    timeout_sec=300.0,
                 )
             else:
                 eval_data, new_session_id = await run_supervised_dsh_task(
