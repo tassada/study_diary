@@ -374,13 +374,14 @@ async def execute_dictionary_lookup_job(
             "}"
         )
 
-        vlm_json = await call_supervised_vlm_json(
-            task_kind="dictionary_lookup",
-            prompt_text=vlm_prompt,
-            images=vlm_images,
-            audit_fn=audit_dsh_payload_completeness,
-            audit_context={"expectedCount": expected_regions},
-        )
+        async with job_supervisor.keep_alive(job_id):
+            vlm_json = await call_supervised_vlm_json(
+                task_kind="dictionary_lookup",
+                prompt_text=vlm_prompt,
+                images=vlm_images,
+                audit_fn=audit_dsh_payload_completeness,
+                audit_context={"expectedCount": expected_regions},
+            )
         raw_entries = vlm_json.get("entries") or []
 
         stored_entries: list[dict] = []

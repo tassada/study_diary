@@ -6,6 +6,7 @@ import uuid
 import httpx
 from app.config import settings
 from app.models import AsyncJobModel, ChildModel
+from app.services.async_worker import is_same_mistake_question
 from app.services.dsh_supervisor import (
     JobSupervisorWatchdog,
     audit_dsh_payload_completeness,
@@ -165,6 +166,73 @@ def test_watchdog_thread_dispatches_orphaned_job() -> None:
 
     asyncio.run(_run_watchdog_check())
     assert recovered_ids == ["job-orphan-unit"]
+
+
+def test_keep_alive_prevents_false_recovery_and_deduplicates_mistakes() -> None:
+    assert is_same_mistake_question(
+        "路灯下影子的长短变化",
+        "img-968ca68b8c6e",
+        "路灯下影子长短变化",
+        "img-968ca68b8c6e",
+    )
+    assert is_same_mistake_question(
+        "位置②能否看到落日（画视线说明）",
+        "img-c205b6f8661c",
+        "位置②能否看到落日并画图说明",
+        "img-c205b6f8661c",
+    )
+    assert not is_same_mistake_question(
+        "看不到前方红绿灯的汽车",
+        "img-6537f3ec3130",
+        "乘船拍摄照片的先后顺序",
+        "img-6537f3ec3130",
+    )
+
+    recovered: list[str] = []
+
+    async def _run() -> None:
+        watchdog = JobSupervisorWatchdog(check_interval_sec=0.05, stall_timeout_sec=0.14)
+        active_job = AsyncJobModel(
+            id="job-long-vlm",
+            child_id="child_unit",
+            task_id="task_unit",
+            job_type="homework_review",
+            status="dsh_running",
+            progress_text="VLM 正在批阅四页大卷...",
+            created_at=datetime.now(timezone.utc).isoformat(),
+        )
+
+        class FakeResult:
+            def scalars(self):
+                return self
+
+            def all(self):
+                return [active_job]
+
+        class FakeSession:
+            async def execute(self, _stmt):
+                return FakeResult()
+
+        class FakeSessionCtx:
+            async def __aenter__(self):
+                return FakeSession()
+
+            async def __aexit__(self, *args):
+                return False
+
+        async def fake_dispatcher(job: AsyncJobModel) -> None:
+            recovered.append(job.id)
+
+        watchdog.mark_started("job-long-vlm")
+        with patch("app.services.dsh_supervisor.AsyncSessionLocal", return_value=FakeSessionCtx()):
+            async with watchdog.keep_alive("job-long-vlm", interval_sec=0.04):
+                for _ in range(6):
+                    await asyncio.sleep(0.05)
+                    await watchdog._scan_and_recover()
+        watchdog.mark_finished("job-long-vlm")
+
+    asyncio.run(_run())
+    assert recovered == []
 
 
 def test_live_lazy_tts_on_demand_and_cache_hit() -> None:

@@ -1,5 +1,6 @@
 import asyncio
 import json
+import re
 import time
 import uuid
 from sqlalchemy import select
@@ -93,11 +94,52 @@ async def parse_voice_tasks_with_dsh(
     }
 
 
+_task_review_locks: dict[str, asyncio.Lock] = {}
+
+
+def get_task_review_lock(task_id: str) -> asyncio.Lock:
+    lock = _task_review_locks.get(task_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _task_review_locks[task_id] = lock
+    return lock
+
+
+def normalize_mistake_title(raw: str) -> str:
+    cleaned = re.sub(r"[\s\W_]+", "", (raw or "").lower())
+    for filler in ("的", "并", "及", "与", "问题"):
+        cleaned = cleaned.replace(filler, "")
+    return cleaned
+
+
+def is_same_mistake_question(
+    title_a: str,
+    image_a: str | None,
+    title_b: str,
+    image_b: str | None,
+) -> bool:
+    na = normalize_mistake_title(title_a)
+    nb = normalize_mistake_title(title_b)
+    if not na or not nb:
+        return False
+    if na == nb:
+        return True
+    if image_a and image_b and image_a != image_b:
+        return False
+    shorter, longer = (na, nb) if len(na) <= len(nb) else (nb, na)
+    if len(shorter) >= 4 and shorter in longer:
+        return True
+    grams_a = {na[i : i + 2] for i in range(max(1, len(na) - 1))}
+    grams_b = {nb[i : i + 2] for i in range(max(1, len(nb) - 1))}
+    overlap = len(grams_a & grams_b) / max(1, min(len(grams_a), len(grams_b)))
+    return overlap >= 0.65
+
+
 async def execute_homework_review_job(job_id: str, task_id: str, upload_kind: str) -> None:
     started = time.perf_counter()
     job_supervisor.mark_started(job_id)
     try:
-        async with AsyncSessionLocal() as db:
+        async with get_task_review_lock(task_id), AsyncSessionLocal() as db:
             task = await db.get(TaskModel, task_id)
             if not task:
                 raise RuntimeError("未找到对应的学习任务")
@@ -156,9 +198,10 @@ async def execute_homework_review_job(job_id: str, task_id: str, upload_kind: st
                             return (img_row, upright_bytes, up_w, up_h, brief, rot_cw)
                         return (img_row, raw_bytes, None, None, brief, 0)
 
-                calibrated_results = await asyncio.gather(
-                    *(calibrate_single_image(r) for r in pending_images)
-                )
+                async with job_supervisor.keep_alive(job_id):
+                    calibrated_results = await asyncio.gather(
+                        *(calibrate_single_image(r) for r in pending_images)
+                    )
                 now_done_iso = utc_now_iso()
                 for img_row, final_bytes, up_w, up_h, brief, rot_cw in calibrated_results:
                     image_bytes_cache[img_row.id] = final_bytes
@@ -267,25 +310,26 @@ async def execute_homework_review_job(job_id: str, task_id: str, upload_kind: st
                 "}"
             )
 
-            if vlm_pages:
-                eval_data = await call_supervised_vlm_json(
-                    task_kind="homework_review",
-                    prompt_text=vlm_review_prompt,
-                    images=vlm_pages,
-                    audit_fn=audit_dsh_payload_completeness,
-                    audit_context={"uploadKind": upload_kind},
-                    max_tokens=min(98304, max(32768, 16384 * len(vlm_pages))),
-                    timeout_sec=300.0,
-                )
-            else:
-                eval_data, new_session_id = await run_supervised_dsh_task(
-                    child,
-                    task_kind="homework_review",
-                    task_prompt=vlm_review_prompt,
-                    context={"uploadKind": upload_kind},
-                )
-                if new_session_id:
-                    child.dsh_tutor_session_id = new_session_id
+            async with job_supervisor.keep_alive(job_id):
+                if vlm_pages:
+                    eval_data = await call_supervised_vlm_json(
+                        task_kind="homework_review",
+                        prompt_text=vlm_review_prompt,
+                        images=vlm_pages,
+                        audit_fn=audit_dsh_payload_completeness,
+                        audit_context={"uploadKind": upload_kind},
+                        max_tokens=min(98304, max(32768, 16384 * len(vlm_pages))),
+                        timeout_sec=300.0,
+                    )
+                else:
+                    eval_data, new_session_id = await run_supervised_dsh_task(
+                        child,
+                        task_kind="homework_review",
+                        task_prompt=vlm_review_prompt,
+                        context={"uploadKind": upload_kind},
+                    )
+                    if new_session_id:
+                        child.dsh_tutor_session_id = new_session_id
 
             mem_note = str(eval_data.get("memoryNote") or "").strip()
             if mem_note:
@@ -344,27 +388,51 @@ async def execute_homework_review_job(job_id: str, task_id: str, upload_kind: st
                         m.mastery_status = "mastered"
                         m.mastered_at = utc_now_iso()
 
-            img_map = {im.id: im for im in all_images}
+            incoming_mistakes = list(eval_data.get("newMistakes") or [])
+            active_mistakes: list[MistakeModel] = []
+            if upload_kind == "initial" and incoming_mistakes:
+                for m in existing_mistakes:
+                    if m.mastery_status == "mastered":
+                        active_mistakes.append(m)
+                    else:
+                        await db.delete(m)
+            else:
+                active_mistakes = list(existing_mistakes)
 
-            for m_item in eval_data.get("newMistakes") or []:
-                m_id = f"mstk-{uuid.uuid4().hex[:12]}"
+            img_map = {im.id: im for im in all_images}
+            seen_keys: list[tuple[str, str | None]] = [
+                (m.question_title, m.image_id) for m in active_mistakes
+            ]
+            inserted_count = 0
+
+            for m_item in incoming_mistakes:
                 src_img_id = m_item.get("imageId")
+                norm_img_id = src_img_id if src_img_id in img_map else None
+                q_title = str(m_item.get("questionTitle") or "重点错题精讲")
+
+                if any(
+                    is_same_mistake_question(q_title, norm_img_id, prev_t, prev_img)
+                    for prev_t, prev_img in seen_keys
+                ):
+                    continue
+                seen_keys.append((q_title, norm_img_id))
+
+                m_id = f"mstk-{uuid.uuid4().hex[:12]}"
                 box_coords = m_item.get("box") or []
                 crop_key: str | None = None
 
-                if src_img_id and src_img_id in img_map and isinstance(box_coords, list) and len(box_coords) == 4:
-                    if src_img_id not in image_bytes_cache:
-                        raw_b, _ = await minio_gateway.get_object_bytes(img_map[src_img_id].minio_key)
-                        image_bytes_cache[src_img_id] = raw_b
+                if norm_img_id and isinstance(box_coords, list) and len(box_coords) == 4:
+                    if norm_img_id not in image_bytes_cache:
+                        raw_b, _ = await minio_gateway.get_object_bytes(img_map[norm_img_id].minio_key)
+                        image_bytes_cache[norm_img_id] = raw_b
                     cropped_jpeg = crop_mistake_region_jpeg(
-                        image_bytes_cache[src_img_id],
+                        image_bytes_cache[norm_img_id],
                         [int(v) for v in box_coords],
                     )
                     if cropped_jpeg:
                         crop_key = f"ocr-crops/{task.child_id}/{m_id}.jpg"
                         await minio_gateway.put_bytes(crop_key, cropped_jpeg, "image/jpeg")
 
-                q_title = str(m_item.get("questionTitle") or "重点错题精讲")
                 w_snip = str(m_item.get("wrongSnippet") or "见原卷标注区域")
                 e_cause = str(m_item.get("errorCause") or "审题或计算细节需留意")
                 c_steps = [str(s) for s in (m_item.get("correctSteps") or ["对照题目条件逐步演算核对"])]
@@ -386,7 +454,7 @@ async def execute_homework_review_job(job_id: str, task_id: str, upload_kind: st
                         id=m_id,
                         child_id=child.id,
                         task_id=task.id,
-                        image_id=src_img_id if src_img_id in img_map else None,
+                        image_id=norm_img_id,
                         question_title=q_title,
                         wrong_snippet=w_snip,
                         error_cause=e_cause,
@@ -399,6 +467,7 @@ async def execute_homework_review_job(job_id: str, task_id: str, upload_kind: st
                         mastery_status="open",
                     )
                 )
+                inserted_count += 1
 
             final_iso = utc_now_iso()
             task.updated_at = final_iso
@@ -419,9 +488,11 @@ async def execute_homework_review_job(job_id: str, task_id: str, upload_kind: st
                 uploadKind=upload_kind,
                 ocrNewImages=total_pending,
                 earnedScore=task.earned_score,
-                newMistakes=len(eval_data.get("newMistakes") or []),
+                newMistakes=inserted_count,
                 elapsedMs=round((time.perf_counter() - started) * 1000, 1),
             )
+    except asyncio.CancelledError:
+        raise
     except Exception as exc:
         log_error(
             "homework.review_failed",
@@ -527,11 +598,12 @@ async def execute_daily_evaluation_job(job_id: str, child_id: str, eval_date: st
                 "}"
             )
 
-            eval_out, new_session_id = await run_supervised_dsh_task(
-                child,
-                task_kind="daily_eval",
-                task_prompt=prompt,
-            )
+            async with job_supervisor.keep_alive(job_id):
+                eval_out, new_session_id = await run_supervised_dsh_task(
+                    child,
+                    task_kind="daily_eval",
+                    task_prompt=prompt,
+                )
             if new_session_id:
                 child.dsh_tutor_session_id = new_session_id
 

@@ -1,9 +1,10 @@
 import asyncio
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 import json
 import threading
 import time
-from typing import Any, Callable, Coroutine
+from typing import Any, AsyncIterator, Callable, Coroutine
 from sqlalchemy import select
 from ..database import AsyncSessionLocal
 from ..models import AsyncJobModel, ChildModel, TaskModel, utc_now_iso
@@ -239,7 +240,7 @@ JobDispatcher = Callable[[AsyncJobModel], Coroutine[Any, Any, None]]
 
 
 class JobSupervisorWatchdog:
-    def __init__(self, check_interval_sec: float = 10.0, stall_timeout_sec: float = 180.0) -> None:
+    def __init__(self, check_interval_sec: float = 10.0, stall_timeout_sec: float = 360.0) -> None:
         self._check_interval_sec = check_interval_sec
         self._stall_timeout_sec = stall_timeout_sec
         self._lock = threading.Lock()
@@ -248,19 +249,52 @@ class JobSupervisorWatchdog:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._dispatcher: JobDispatcher | None = None
         self._active_heartbeats: dict[str, float] = {}
+        self._running_tasks: dict[str, asyncio.Task[Any]] = {}
         self._recovery_counts: dict[str, int] = {}
 
     def mark_started(self, job_id: str) -> None:
+        try:
+            cur_task = asyncio.current_task()
+        except RuntimeError:
+            cur_task = None
         with self._lock:
             self._active_heartbeats[job_id] = time.monotonic()
+            if cur_task is not None:
+                self._running_tasks[job_id] = cur_task
 
     def heartbeat(self, job_id: str) -> None:
         with self._lock:
             self._active_heartbeats[job_id] = time.monotonic()
 
     def mark_finished(self, job_id: str) -> None:
+        try:
+            cur_task = asyncio.current_task()
+        except RuntimeError:
+            cur_task = None
         with self._lock:
-            self._active_heartbeats.pop(job_id, None)
+            existing = self._running_tasks.get(job_id)
+            if existing is None or cur_task is None or existing is cur_task:
+                self._active_heartbeats.pop(job_id, None)
+                self._running_tasks.pop(job_id, None)
+
+    @asynccontextmanager
+    async def keep_alive(self, job_id: str, interval_sec: float = 25.0) -> AsyncIterator[None]:
+        self.heartbeat(job_id)
+
+        async def _pulse() -> None:
+            while True:
+                await asyncio.sleep(interval_sec)
+                self.heartbeat(job_id)
+
+        pulse_task = asyncio.create_task(_pulse())
+        try:
+            yield
+        finally:
+            pulse_task.cancel()
+            try:
+                await pulse_task
+            except asyncio.CancelledError:
+                pass
 
     def start(self, loop: asyncio.AbstractEventLoop, dispatcher: JobDispatcher) -> None:
         with self._lock:
@@ -353,8 +387,12 @@ class JobSupervisorWatchdog:
                 continue
 
             with self._lock:
+                stale_task = self._running_tasks.pop(job.id, None)
                 self._recovery_counts[job.id] = attempts + 1
                 self._active_heartbeats[job.id] = now_mono
+
+            if stale_task is not None and not stale_task.done():
+                stale_task.cancel()
 
             log_warn(
                 "supervisor.job_recovering",
